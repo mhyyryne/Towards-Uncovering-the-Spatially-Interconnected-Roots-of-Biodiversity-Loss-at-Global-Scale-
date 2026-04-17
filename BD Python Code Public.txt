@@ -1,0 +1,2715 @@
+# THIS IS THE CODE FOR THE SPATIAL BIODIVERSITY ANALYSIS
+# UPDATED 9.2.2026
+# Aja koodi täällä:
+# https://colab.research.google.com/
+
+import pandas as pd
+import numpy as np
+from libpysal.weights import KNN, W
+from scipy.sparse import block_diag
+from spreg import ML_Lag
+
+# ----------------------------
+# User settings
+# ----------------------------
+FILE = "Biodiversity_with_LogSpecies.xlsx"
+K_NEIGHBORS = 12
+JITTER_SEED = 42
+JITTER_SD = 1e-9
+
+X_vars = [
+    "Gdp_per_Capita", "Population_Density", "Agricultural_Land_Area",
+    "Average_Yield", "Average_Stock", "Corruption_Control",
+    "Political_Stability", "Rule_of_Law", "HDI"
+]
+needed = ["Deforestation_Index"] + X_vars + ["Latitude", "Longitude", "Country", "Year"]
+
+
+# ----------------------------
+# 1) Read + clean
+# ----------------------------
+df = pd.read_excel(FILE, engine="openpyxl")
+df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=needed)
+
+# ----------------------------
+# 2) Balanced panel (Year-major, Country-minor)
+# ----------------------------
+df_panel = df.sort_values(["Year", "Country"]).reset_index(drop=True)
+T = df_panel["Year"].nunique()
+
+df_bal = (
+    df_panel.groupby("Country")
+    .filter(lambda g: len(g) == T)
+    .sort_values(["Year", "Country"])
+    .reset_index(drop=True)
+)
+
+print("Balanced panel rows:", df_bal.shape[0])
+print("Countries:", df_bal["Country"].nunique())
+
+print("Years:", df_bal["Year"].nunique())
+
+# Sanity: balanced means rows == countries * years
+assert df_bal.shape[0] == df_bal["Country"].nunique() * df_bal["Year"].nunique()
+
+# ----------------------------
+# 3) Country-level coordinates (one row per country)
+# ----------------------------
+df_countries = (
+    df_bal[["Country", "Longitude", "Latitude"]]
+    .drop_duplicates("Country")
+    .sort_values("Country")
+    .reset_index(drop=True)
+)
+
+# 3D unit sphere coordinates (deterministic global geometry)
+lon = np.deg2rad(df_countries["Longitude"].to_numpy())
+lat = np.deg2rad(df_countries["Latitude"].to_numpy())
+coords3 = np.column_stack([
+    np.cos(lat) * np.cos(lon),
+    np.cos(lat) * np.sin(lon),
+    np.sin(lat)
+
+])
+
+# Deterministic jitter only if duplicate lon/lat exist
+if df_countries.duplicated(["Longitude", "Latitude"]).any():
+    rng = np.random.default_rng(JITTER_SEED)
+    coords3 = coords3 + rng.normal(0, JITTER_SD, coords3.shape)
+
+W_country = KNN.from_array(coords3, k=K_NEIGHBORS)
+W_country.transform = "R"
+
+print("Neighbors signature (first 10):", {i: W_country.neighbors[i] for i in range(10)})
+
+# ----------------------------
+# 4) Block-diagonal panel W
+# ----------------------------
+W_sparse = block_diag([W_country.sparse] * T, format="csr")
+
+row_ptr = W_sparse.indptr
+col_ind = W_sparse.indices
+data = W_sparse.data
+N = W_sparse.shape[0]
+
+neighbors, weights = {}, {}
+for i in range(N):
+    start, end = row_ptr[i], row_ptr[i + 1]
+    cols = col_ind[start:end]
+    vals = data[start:end]
+    mask = cols != i
+    neighbors[i] = cols[mask].tolist()
+    weights[i]   = vals[mask].tolist()
+
+W_panel = W(neighbors=neighbors, weights=weights)
+W_panel.transform = "R"
+
+assert W_panel.n == df_bal.shape[0]
+print("W_panel.n:", W_panel.n)
+
+
+
+
+# ----------------------------
+# 5) Raw y and X (NO FE)
+# ----------------------------
+y = df_bal["Deforestation_Index"].astype(float).to_numpy().reshape((-1, 1))
+X = df_bal[X_vars].astype(float).to_numpy()
+print("Mean y:", float(y.mean()))
+print("X shape:", X.shape)
+
+# ----------------------------
+# 6) ML SDM (Durbin) via slx_lags=1
+# ----------------------------
+m_sdm_ml = ML_Lag(
+    y=y,
+    x=X,
+    w=W_panel,
+    slx_lags=1,            # SDM (adds WX automatically)
+    slx_vars="All",
+    method="full",
+    spat_impacts="simple",
+    spat_diag=True,
+    name_y="Deforestation",
+    name_x=X_vars,
+    name_w="W_panel"
+)
+
+print("rho:", m_sdm_ml.rho)
+print(m_sdm_ml.summary)
+
+
+# --- 7) IMPACT DECOMPOSITION (ADI / AII / ATI) + UNCERTAINTY INTERVALS ---
+
+from spreg import ML_Lag
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+# Aja malli uudelleen niin, että spat_impacts='all' (tai 'full')
+m_sdm_imp = ML_Lag(
+    y=y,
+    x=X,
+    w=W_panel,
+    slx_lags=1,
+    slx_vars="All",
+    method="full",
+    spat_impacts="all",       # <-- Tämä tuottaa ADI/AII/ATI
+    spat_diag=True,
+    name_y="Deforestation",
+    name_x=X_vars,
+    name_w="W_panel"
+)
+
+print("\n=== SPATIAL IMPACTS (ADI / AII / ATI) ===")
+
+print(m_sdm_imp.summary)
+
+
+# --- 8) IMPACTS (ADI/AII/ATI) – version-agnostinen toteutus ---
+# === A1. TUONTI ===
+import numpy as np
+import pandas as pd
+from scipy.sparse import eye as speye
+from scipy.sparse.linalg import splu
+from numpy.random import default_rng
+
+# === A2. FUNKTIOT (versio-agnostinen SDM impacts + CI) ===
+def parse_coeffs(model, X_vars):
+    names = model.name_x
+    betas = np.asarray(model.betas).flatten()
+    if betas.size == len(names) + 1:
+        betas_wo_rho = betas[1:]
+    else:
+        betas_wo_rho = betas.copy()
+    beta_map, theta_map = {}, {}
+    const_beta = None
+    for nm, b in zip(names, betas_wo_rho):
+        if nm.upper() in ("CONSTANT","CONST","INTERCEPT"):
+            const_beta = float(b); continue
+        if nm.startswith("W_"):
+            theta_map[nm[2:]] = float(b)
+        else:
+           beta_map[nm] = float(b)
+    for x in X_vars:
+        theta_map.setdefault(x, 0.0)
+    order_info = [(x, theta_map[x]!=0.0) for x in X_vars]
+    return beta_map, theta_map, const_beta, order_info
+
+def impacts_for_var(rho, W, beta_j, theta_j, R=256, rng=None):
+    if rng is None:
+        rng = default_rng(42)
+    n = W.n
+    I = speye(n, format="csc")
+    Ws = W.sparse.tocsc()
+    A = (I - rho * Ws)
+    lu = splu(A)
+    ones = np.ones((n,1))
+    M1 = beta_j*ones + theta_j*(Ws @ ones)
+    SM1 = lu.solve(M1)
+    total = float(SM1.mean())
+    z = rng.choice([-1.0, 1.0], size=(n, R))
+    Sz = lu.solve(z)
+    trace_S_hat = float((z * Sz).sum(axis=0).mean())
+    Wz = Ws @ z
+    SWz = lu.solve(Wz)
+    trace_SW_hat = float((z * SWz).sum(axis=0).mean())
+    direct = (beta_j*trace_S_hat + theta_j*trace_SW_hat) / n
+    indirect = total - direct
+    return direct, indirect, total
+
+def align_mean_cov(model):
+    cov = getattr(model, "vm", None)
+    if cov is None:
+        cov1 = np.asarray(model.vm1)
+        cov = cov1[:-1,:-1]
+    else:
+        cov = np.asarray(cov)
+    names = list(model.name_x)
+    bet = np.asarray(model.betas).flatten()
+    rho = float(model.rho)
+    p = cov.shape[0]
+    if bet.size == p:
+        if p == len(names)+1:
+            theta_hat = np.concatenate(([rho], bet))
+            param_names = ["rho"] + names
+        else:
+            theta_hat = bet
+            param_names = names
+    elif bet.size == p - 1:
+        theta_hat = np.concatenate(([rho], bet))
+        param_names = ["rho"] + names
+    elif bet.size == p + 1:
+        theta_hat = bet[:-1]
+        if p == len(names)+1:
+            param_names = ["rho"] + names
+        else:
+            param_names = names
+    else:
+        raise ValueError(f"Cannot align mean len={bet.size} with cov {cov.shape}")
+    cov = (cov + cov.T)/2.0
+    cov += 1e-12*np.eye(cov.shape[0])
+    return theta_hat, cov, param_names
+
+def build_index_maps(param_names, X_vars):
+    name_to_idx = {nm:i for i,nm in enumerate(param_names)}
+    rho_idx = name_to_idx.get("rho", None)
+    beta_idx = {x: name_to_idx.get(x, None) for x in X_vars}
+    theta_idx = {x: name_to_idx.get(f"W_{x}", None) for x in X_vars}
+    return rho_idx, beta_idx, theta_idx
+
+def sdm_impacts_with_ci(model, W, X_vars, M=2000, R=256, seed=123):
+    rng = default_rng(seed)
+    theta_hat, cov, param_names = align_mean_cov(model)
+    rho_idx, beta_idx, theta_idx = build_index_maps(param_names, X_vars)
+    rho_hat = float(theta_hat[rho_idx]) if rho_idx is not None else float(model.rho)
+    tmp = parse_coeffs(model, X_vars)
+    if len(tmp) == 4:
+        beta_map, theta_map, const_beta, _ = tmp
+    else:
+        beta_map, theta_map, const_beta = tmp
+    # Piste-estimaatit
+    point_records=[]
+    for x in X_vars:
+        d0,i0,t0 = impacts_for_var(rho_hat, W, beta_map.get(x,0.0), theta_map.get(x,0.0), R=R, rng=rng)
+        point_records.append((x,d0,i0,t0))
+    point_df = pd.DataFrame(point_records, columns=["Variable","Direct","Indirect","Total"])
+    # Monte Carlo
+    p = cov.shape[0]
+    L = np.linalg.cholesky(cov)
+    z = rng.standard_normal(size=(M,p))
+    draws = theta_hat + z @ L.T
+    d_sims=[]; i_sims=[]; t_sims=[]
+    for b in draws:
+        rho_s = float(b[rho_idx]) if rho_idx is not None else rho_hat
+        b_map = {x: (float(b[beta_idx[x]]) if beta_idx[x] is not None else beta_map.get(x,0.0)) for x in X_vars}
+        t_map = {x: (float(b[theta_idx[x]]) if theta_idx[x] is not None else theta_map.get(x,0.0)) for x in X_vars}
+        d_row=[]; i_row=[]; t_row=[]
+        for x in X_vars:
+            d,i,t = impacts_for_var(rho_s, W, b_map[x], t_map[x], R=R, rng=rng)
+            d_row.append(d); i_row.append(i); t_row.append(t)
+        d_sims.append(d_row); i_sims.append(i_row); t_sims.append(t_row)
+    d_sims = np.asarray(d_sims); i_sims = np.asarray(i_sims); t_sims = np.asarray(t_sims)
+    def ci95(a): return np.percentile(a, 2.5, axis=0), np.percentile(a, 97.5, axis=0)
+    d_lo,d_hi = ci95(d_sims); i_lo,i_hi = ci95(i_sims); t_lo,t_hi = ci95(t_sims)
+    out = point_df.copy()
+    out["Direct_CI_L"]=d_lo; out["Direct_CI_U"]=d_hi
+    out["Indirect_CI_L"]=i_lo; out["Indirect_CI_U"]=i_hi
+    out["Total_CI_L"]=t_lo; out["Total_CI_U"]=t_hi
+    return out
+
+# === A3. LASKE effects_ci_df (valitse M ja R tarpeen mukaan) ===
+effects_ci_df = sdm_impacts_with_ci(
+    model=m_sdm_imp,    # SDM-malli jonka jo ajoit (ML_Lag, slx_lags=1)
+    W=W_panel,          # panelin W
+    X_vars=X_vars,      # selittäjien nimet samassa järjestyksessä kuin datassa
+    M=1000,             # aloita 500–1000 (nopeampi), nosta 2000–5000 julkaisua varten
+    R=256,              # diag-trace vektorit; nosta 512–1024 jos haluat tarkkuutta
+    seed=123
+)
+print("effects_ci_df ready:", effects_ci_df.shape)
+effects_ci_df.head()
+
+
+
+# === B1. TAULUKKO: siistintä + järjestys + näyttö + tallennus ===
+import pandas as pd
+import numpy as np
+from IPython.display import display
+
+tbl = effects_ci_df.copy()
+
+# Poista INTERCEPT, jos sellainen mukana (joissain virityksissä sitä ei edes ole)
+if (tbl["Variable"].str.upper().isin(["CONSTANT","CONST","INTERCEPT"]).any()):
+    tbl = tbl[~tbl["Variable"].str.upper().isin(["CONSTANT","CONST","INTERCEPT"])]
+
+# Pyöristys
+dec = 3
+for col in ["Direct","Direct_CI_L","Direct_CI_U",
+            "Indirect","Indirect_CI_L","Indirect_CI_U",
+            "Total","Total_CI_L","Total_CI_U"]:
+    tbl[col] = tbl[col].astype(float).round(dec)
+
+# Järjestys: suurin |Total| ensin
+tbl = tbl.reindex(tbl["Total"].abs().sort_values(ascending=False).index)
+
+display(tbl.reset_index(drop=True))
+
+# Tallennus
+tbl.to_csv("SDM_impacts_ADI_AII_ATI_with_CI.csv", index=False)
+latex_str = tbl.to_latex(index=False, escape=True, float_format=f"%.{dec}f")
+with open("SDM_impacts_ADI_AII_ATI_with_CI.tex","w", encoding="utf-8") as f:
+    f.write(latex_str)
+print("✅ Tallennettu: CSV + LaTeX")
+
+
+
+# === B2. FOREST-PLOT: Direct / Indirect / Total (95% CI) tärkeimmille muuttujille ===
+import matplotlib.pyplot as plt
+# Valitse “keskeiset” muuttujat:
+focus_vars = []        # esim. ["Agricultural_Land_Area","Average_Stock","HDI"]
+top_k = 10             # jos lista tyhjä, poimitaan top_k suurinta |Total|
+if not focus_vars:
+    focus_vars = tbl.iloc[:top_k]["Variable"].tolist()
+plot_df = tbl[tbl["Variable"].isin(focus_vars)].copy()
+plot_df["__order__"] = plot_df.index
+plot_df = plot_df.sort_values("__order__", ascending=False).drop(columns="__order__")
+def _forest_axis(ax, df, center_col, lo_col, hi_col, title, color):
+    y = np.arange(len(df))
+    x = df[center_col].values
+    lo = df[lo_col].values
+    hi = df[hi_col].values
+    err_low  = x - lo
+    err_high = hi - x
+    ax.errorbar(x, y, xerr=[err_low, err_high], fmt='o', color=color, ecolor=color,
+                elinewidth=1.5, capsize=3, markersize=5)
+    ax.axvline(0, color="k", lw=1, alpha=0.6)
+    ax.set_title(title, fontsize=11)
+    ax.set_yticks(y)
+    ax.set_yticklabels(df["Variable"], fontsize=9)
+    ax.grid(axis='x', linestyle='--', alpha=0.3)
+    xmin = min(lo.min(), 0); xmax = max(hi.max(), 0); span = xmax - xmin
+    ax.set_xlim(xmin - 0.05*span, xmax + 0.05*span)
+fig, axes = plt.subplots(1, 3, figsize=(14, 0.45*len(plot_df) + 2), sharey=True)
+_forest_axis(axes[0], plot_df, "Direct",   "Direct_CI_L",   "Direct_CI_U",   "Direct (ADI)",   color="#1b9e77")
+_forest_axis(axes[1], plot_df, "Indirect", "Indirect_CI_L", "Indirect_CI_U", "Indirect (AII)", color="#d95f02")
+_forest_axis(axes[2], plot_df, "Total",    "Total_CI_L",    "Total_CI_U",    "Total(ATI)",    color="#7570b3")
+axes[0].set_ylabel("")
+fig.suptitle("Spatial Durbin Model — Impacts (+95% CI)", fontsize=13, y=1.02)
+plt.tight_layout()
+plt.show()
+fig.savefig("SDM_forest_plot_ADI_AII_ATI.png", dpi=300, bbox_inches="tight")
+print("✅ Tallennettu: SDM_forest_plot_ADI_AII_ATI.png")
+
+
+
+########################################################################################################
+# ============================================================
+# 9) DIAGNOSTIIKKA: MORAN’S I, LM-TESTIT, COMMON FACTOR -KOE
+# ============================================================
+import numpy as np
+import pandas as pd
+
+# --- 9.1 OLS (ei-FE) ja LM-testit (lag vs error) ----------------------------
+from spreg import OLS  # PySAL-spreg OLS
+print("\n[9.1] OLS (no FE) + LM diagnostics")
+
+# OLS: käytetään samaa X:a kuin SDM:ssä. OLS lisää vakiotermin oletuksena.
+m_ols = OLS(
+    y=y, x=X, w=W_panel,
+    spat_diag=True,  # -> laskee LM_error, LM_lag, robustit yms.
+    name_y="Deforestation", name_x=X_vars, name_w="W_panel"
+)
+
+# Jäännökset ja LM-testit
+resid_ols = np.asarray(m_ols.u).reshape(-1, 1)
+def _safe(name):
+    return getattr(m_ols, name, None)
+
+lm_out = {
+    "LM_error": _safe("lm_error"),
+    "LM_lag": _safe("lm_lag"),
+    "Robust_LM_error": _safe("rlm_error"),
+    "Robust_LM_lag": _safe("rlm_lag"),
+    "LM_SARMA": _safe("lm_sarma"),
+    "Robust_LM_SARMA": _safe("rlm_sarma"),
+}
+print("LM diagnostics (stat, p):", lm_out)
+
+# --- 9.2 Two-way FE (TWFE) OLS jäännökset ja Moran’s I ----------------------
+print("\n[9.2] Two-way FE (TWFE) demeaning for y and X + OLS (no constant)")
+
+# Kaksi­suuntainen within-transform (maa- ja vuosivakiot)
+df_dm = df_bal.copy()
+cols_dm = ["Deforestation_Index"] + X_vars
+for c in cols_dm:
+    df_dm[f"{c}_dm"] = (
+        df_bal[c]
+        - df_bal.groupby("Country")[c].transform("mean")
+        - df_bal.groupby("Year")[c].transform("mean")
+        + df_bal[c].mean()
+    )
+
+# TWFE-demeanattu y ja X (ilman vakiota)
+y_twfe = df_dm["Deforestation_Index_dm"].to_numpy(dtype=float).reshape(-1, 1)
+X_twfe = df_dm[[f"{c}_dm" for c in X_vars]].to_numpy(dtype=float)
+
+# OLS ilman vakiota (spreg.OLS lisää vakion oletuksena -> kytketään pois)
+m_ols_twfe = OLS(
+    y=y_twfe, x=X_twfe, w=W_panel,
+    spat_diag=False,  # LM-testit eivät ole tässä välttämättömiä
+    constant=False,
+    name_y="Deforestation(TWFE)", name_x=[f"{c}_dm" for c in X_vars], name_w="W_panel"
+)
+resid_twfe = np.asarray(m_ols_twfe.u).reshape(-1, 1)
+
+# --- 9.3 Moran’s I jäännöksille (OLS & TWFE) --------------------------------
+print("\n[9.3] Moran’s I for residuals (OLS and TWFE)")
+from esda import Moran
+
+# Huom: käytämme panel-W:tä (W_panel), koska jäännökset ovat paneelitasolla.
+mi_ols = Moran(resid_ols.flatten(), W_panel, permutations=999)
+mi_twfe = Moran(resid_twfe.flatten(), W_panel, permutations=999)
+
+print(f"Moran's I (OLS): I={mi_ols.I:.4f}, p_sim={mi_ols.p_sim:.4f}, EI={mi_ols.EI:.4f}")
+print(f"Moran's I (TWFE): I={mi_twfe.I:.4f}, p_sim={mi_twfe.p_sim:.4f}, EI={mi_twfe.EI:.4f}")
+
+# Tallennus (liitettä varten)
+with open("DIAG_Residual_MoranI.txt", "w", encoding="utf-8") as f:
+    f.write(f"OLS:    I={mi_ols.I:.6f}, p_sim={mi_ols.p_sim:.6f}, E[I]={mi_ols.EI:.6f}\n")
+    f.write(f"TWFE:   I={mi_twfe.I:.6f}, p_sim={mi_twfe.p_sim:.6f}, E[I]={mi_twfe.EI:.6f}\n")
+
+# --- 9.4 LM-testit (raportointi taulukoksi) ----------------------------------
+print("\n[9.4] Export LM-tests to CSV")
+def _as_tuple(x):
+    try:
+        return (float(x[0]), float(x[1]))
+    except Exception:
+        return (np.nan, np.nan)
+
+lm_tbl = []
+for k, v in lm_out.items():
+    stat, p = _as_tuple(v) if v is not None else (np.nan, np.nan)
+    lm_tbl.append((k, stat, p))
+lm_df = pd.DataFrame(lm_tbl, columns=["Test", "Statistic", "p_value"])
+lm_df.to_csv("DIAG_LM_tests_OLS.csv", index=False)
+print(lm_df)
+
+
+
+# --- 9.5 Common factor -koe SDM: SDM vs. SEM (Wald) --------------------------
+# H0: theta_j + rho * beta_j = 0  for all regressors (SDM collapses to SEM)
+
+from scipy.stats import chi2
+
+def common_factor_wald(model, X_vars):
+    """
+    Wald-test for the common-factor restriction:
+    H0: θ_j + ρ * β_j = 0  for all j in X_vars.
+    Works across spreg versions where ρ may or may not be inside theta_hat.
+    """
+    # 1) Hae yhdenmukaiset parametrit ja kovarianssi
+    theta_hat, cov, param_names = align_mean_cov(model)
+
+    # 2) Rakenna indeksit ρ:lle, β:lle ja θ:lle (WX-kertoimille)
+    rho_idx, beta_idx, theta_idx = build_index_maps(param_names, X_vars)
+
+    # 3) ρ-hattu: jos sitä ei ole theta_hat-vektorissa, ota model.rho
+    if rho_idx is None:
+        rho_hat = float(model.rho)
+    else:
+        rho_hat = f
+
+    # 4) Muodosta φ-vektori ja gradienttimatriisi G s.e.-laskentaa varten
+    p = cov.shape[0]
+    phi_vals = []
+    G = np.zeros((len(X_vars), p))
+
+    for r, x in enumerate(X_vars):
+        b_idx = beta_idx[x]
+        t_idx = theta_idx[x]
+
+        beta_hat = float(theta_hat[b_idx]) if b_idx is not None else 0.0
+        theta_x  = float(theta_hat[t_idx]) if t_idx is not None else 0.0
+
+        # φ_j = θ_j + ρ * β_j
+        phi = theta_x + rho_hat * beta_hat
+        phi_vals.append(phi)
+
+        # gradientit: ∂φ/∂ρ = β_j ; ∂φ/∂β_j = ρ ; ∂φ/∂θ_j = 1
+        if rho_idx is not None:
+            G[r, rho_idx] = beta_hat
+        if b_idx is not None:
+            G[r, b_idx] = rho_hat
+        if t_idx is not None:
+            G[r, t_idx] = 1.0
+
+    phi = np.asarray(phi_vals).reshape(-1, 1)
+
+    # 5) Var(φ) = G Σ G'
+    V_phi = G @ cov @ G.T
+    V_phi = (V_phi + V_phi.T) / 2.0
+    V_phi += 1e-12 * np.eye(V_phi.shape[0])
+
+    # 6) Wald = φ' V_phi^{-1} φ ~ χ^2_k,  k = len(X_vars)
+    W_stat = float(phi.T @ np.linalg.inv(V_phi) @ phi)
+    df = len(X_vars)
+    p_val = 1.0 - chi2.cdf(W_stat, df)
+
+    return W_stat, df, p_val, pd.Series(phi.flatten(), index=X_vars)
+
+
+# ----- KUTSU JA TALLENNUS ----------------------------------------------------
+
+# Käytä SDM-mallia, joka sis. WX-kertoimet ja kovarianssin:
+# m_sdm_imp (spat_impacts='all') on varmin valinta, mutta m_sdm_ml käy myös.
+W_stat, df_cf, p_cf, phi_series = common_factor_wald(m_sdm_imp, X_vars)
+
+print(f"Common factor Wald: W={W_stat:.3f}, df={df_cf}, p={p_cf:.4g}")
+
+phi_series.to_csv(
+    "DIAG_CommonFactor_phi_theta_plus_rho_beta.csv",
+    header=["phi(theta + rho*beta)"]
+)
+
+with open("DIAG_CommonFactor_Wald.txt", "w", encoding="utf-8") as f:
+    f.write(f"Wald statistic: {W_stat}\n")
+    f.write(f"Degrees of freedom: {df_cf}\n")
+    f.write(f"p-value: {p_cf}\n")
+
+print("Saved: DIAG_CommonFactor_Wald.txt + DIAG_CommonFactor_phi_theta_plus_rho_beta.csv")
+
+
+#############################################################################################
+
+
+# =================== W-sensitivity (robusti, ilman impactsia) =================
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from math import log
+from scipy.sparse import block_diag
+from libpysal.weights import W, KNN
+from spreg import ML_Lag
+
+# -- Helpers (jos eivät jo ole muistissa) -------------------------------------
+def haversine_km(lon, lat):
+    R=6371.0088
+    lon=np.deg2rad(lon); lat=np.deg2rad(lat)
+    N=len(lon); D=np.zeros((N,N), float)
+    for i in range(N):
+        dlon=lon-lon[i]; dlat=lat-lat[i]
+        a=np.sin(dlat/2)**2 + np.cos(lat[i])*np.cos(lat)*np.sin(dlon/2)**2
+        D[i,:]=2*R*np.arcsin(np.minimum(1.0, np.sqrt(a)))
+    np.fill_diagonal(D,0.0); return D
+
+def panelize_W(W_country, T):
+    W_sparse=block_diag([W_country.sparse]*T, format="csr")
+    row_ptr,col_ind,data=W_sparse.indptr,W_sparse.indices,W_sparse.data
+    N=W_sparse.shape[0]; neighbors,weights={},{}
+    for i in range(N):
+        st,en=row_ptr[i],row_ptr[i+1]
+        cols=col_ind[st:en]; vals=data[st:en]
+        mask=cols!=i
+        neighbors[i]=cols[mask].tolist(); weights[i]=vals[mask].tolist()
+    Wp=W(neighbors=neighbors, weights=weights); Wp.transform="R"; return Wp
+
+def W_country_knn(coords3, k, row_standardize=True):
+    Wc = KNN.from_array(coords3, k=k)
+    Wc.transform = "R" if row_standardize else "B"
+    return Wc
+
+def W_country_threshold(Dkm, d_max_km, row_standardize=True, ensure_min_neighbor=True):
+    N=Dkm.shape[0]; neighbors={}; weights={}
+    for i in range(N):
+        idx=np.where((Dkm[i,:]>0)&(Dkm[i,:]<=d_max_km))[0]
+        if ensure_min_neighbor and idx.size==0:
+            j=np.argsort(Dkm[i,:])[1]; idx=np.array([j],dtype=int)
+        neighbors[i]=idx.tolist(); weights[i]=[1.0]*len(idx)
+    Wc=W(neighbors=neighbors, weights=weights)
+    Wc.transform="R" if row_standardize else "B"; return Wc
+
+def W_country_decay(Dkm, mode="inverse", alpha=1.0, half_life_km=None,
+                    cutoff_km=None, kmax=None, row_standardize=True):
+    if mode=="inverse":
+        with np.errstate(divide='ignore'):
+            Wraw=np.where(Dkm>0, Dkm**(-alpha), 0.0)
+    elif mode=="exp":
+        assert half_life_km and half_life_km>0
+        lam=log(2.0)/float(half_life_km)
+        Wraw=np.exp(-lam*Dkm); np.fill_diagonal(Wraw,0.0)
+    else:
+        raise ValueError("mode must be 'inverse' or 'exp'")
+    if cutoff_km is not None:
+        Wraw[Dkm>float(cutoff_km)]=0.0
+    neighbors,weights={},{}
+    for i in range(Wraw.shape[0]):
+        wrow=Wraw[i,:].copy()
+        if kmax is not None:
+            nz=np.where(wrow>0)[0]
+            if nz.size>kmax:
+                topk = nz[np.argsort(wrow[nz])[::-1][:kmax]]
+                keep = np.zeros_like(wrow,dtype=bool); keep[topk]=True
+                wrow[~keep]=0.0
+        idx=np.where(wrow>0)[0]
+        neighbors[i]=idx.tolist(); weights[i]=wrow[idx].tolist()
+    Wc=W(neighbors=neighbors, weights=weights)
+    Wc.transform="R" if row_standardize else "B"; return Wc
+
+# -- Turvallinen SDM-ajo ilman impactsia (välttää power expansion -ongelmat) ---
+def run_sdm_with_W(y, X, W_panel, X_vars):
+    m = ML_Lag(
+        y=y, x=X, w=W_panel,
+        slx_lags=1, slx_vars="All",      # SDM
+        method="full",
+        spat_impacts=None,               # <-- EI impactsia gridissä
+        spat_diag=False,                 # nopeampi ja vakaampi tässä vaiheessa
+        name_y="Deforestation", name_x=X_vars, name_w="W_panel"
+    )
+    out = {
+        "rho": float(m.rho),
+        "aic": float(getattr(m, "aic", np.nan)),
+        "loglik": float(getattr(m, "logll", np.nan)),
+        "pseudoR2": float(getattr(m, "pr2_e", np.nan)),
+        "n": int(m.n)
+    }
+    return m, out
+
+# -------- Rakennetaan skenaariot ja ajetaan ----------------------------------
+Nc = df_countries.shape[0]
+lon_c = df_countries["Longitude"].to_numpy(float)
+lat_c = df_countries["Latitude"].to_numpy(float)
+Dkm = haversine_km(lon_c, lat_c)
+
+lon = np.deg2rad(lon_c); lat = np.deg2rad(lat_c)
+coords3 = np.column_stack([np.cos(lat)*np.cos(lon), np.cos(lat)*np.sin(lon), np.sin(lat)])
+T = df_bal["Year"].nunique()
+
+specs=[]
+for k in [8,12,20]: specs.append(("KNN", f"k={k}", {"k":k}))
+specs.append(("THRESH","d<=1500km",{"dmax":1500.0}))
+for alpha in [0.5,1.0,2.0]: specs.append(("DECAY_INV", f"alpha={alpha}", {"alpha":alpha,"cut":None,"kmax":20}))
+for h in [750.0,1000.0,1500.0]: specs.append(("DECAY_EXP", f"half={int(h)}km", {"half":h,"cut":3000.0,"kmax":20}))
+
+rows=[]; models={}; errors=[]
+
+for typ,label,pars in specs:
+    try:
+        if typ=="KNN":
+            Wc=W_country_knn(coords3, pars["k"])
+        elif typ=="THRESH":
+            Wc=W_country_threshold(Dkm, pars["dmax"])
+        elif typ=="DECAY_INV":
+            Wc=W_country_decay(Dkm, mode="inverse", alpha=pars["alpha"],
+                               cutoff_km=pars["cut"], kmax=pars["kmax"])
+        elif typ=="DECAY_EXP":
+            Wc=W_country_decay(Dkm, mode="exp", half_life_km=pars["half"],
+                               cutoff_km=pars["cut"], kmax=pars["kmax"])
+        Wp=panelize_W(Wc, T)
+
+        m,out=run_sdm_with_W(y, X, Wp, X_vars)
+        out.update({"spec_type":typ, "spec_label":label})
+        rows.append(out); models[(typ,label)]=m
+    except Exception as e:
+        errors.append((typ, label, str(e)))
+        rows.append({"spec_type":typ, "spec_label":label,
+                     "rho":np.nan,"aic":np.nan,"loglik":np.nan,"pseudoR2":np.nan,"n":len(y)})
+
+res_df = pd.DataFrame(rows)[["spec_type","spec_label","rho","aic","loglik","pseudoR2","n"]]
+print("\n=== W-sensitivity SDM summary (first rows) ===")
+print(res_df.head(10))
+if errors:
+    print("\n[WARN] The following specs failed (recorded as NaN):")
+    for t,l,msg in errors: print(f"  - {t} | {l}: {msg}")
+
+# --- Järjestys, ΔAIC, tallennus
+order_map={"KNN":0,"THRESH":1,"DECAY_INV":2,"DECAY_EXP":3}
+res_df["_group_order"]=res_df["spec_type"].map(order_map).astype(int)
+res_df["_label_order"]=res_df.groupby("spec_type").cumcount()
+res_df_sorted=res_df.sort_values(["_group_order","_label_order"]).drop(columns=["_group_order","_label_order"])
+best_aic = res_df_sorted["aic"].min() if res_df_sorted["aic"].notna().any() else np.nan
+res_df_sorted["deltaAIC"]=res_df_sorted["aic"] - best_aic
+
+res_df_sorted.to_csv("W_sensitivity_SDM_table.csv", index=False)
+
+
+
+##########################################################################################################################
+# ============================================================
+# ADI/AII/ATI + 95% CI for the best W (DECAY_EXP, half=1500 km) + forest-plot
+# ============================================================
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from math import log
+from scipy.sparse import block_diag
+from scipy.sparse import eye as speye
+from scipy.sparse.linalg import splu
+from numpy.random import default_rng
+from libpysal.weights import W
+from spreg import ML_Lag
+
+# ---------- 1) Helpers: distances, best-W builder, panelization ---------------
+def haversine_km(lon, lat):
+    R = 6371.0088  # km
+    lon = np.deg2rad(lon); lat = np.deg2rad(lat)
+    N = len(lon); D = np.zeros((N, N), float)
+    for i in range(N):
+        dlon = lon - lon[i]; dlat = lat - lat[i]
+        a = np.sin(dlat/2)**2 + np.cos(lat[i])*np.cos(lat)*np.sin(dlon/2)**2
+        D[i, :] = 2*R*np.arcsin(np.minimum(1.0, np.sqrt(a)))
+    np.fill_diagonal(D, 0.0)
+    return D
+
+def W_country_decay_exp(df_countries, half_life_km=1500.0, cutoff_km=3000.0, kmax=20, row_standardize=True):
+    """Negative-exponential distance decay on country centroids; optional cutoff and k-sparsification."""
+    lon = df_countries["Longitude"].to_numpy(float)
+    lat = df_countries["Latitude"].to_numpy(float)
+    Dkm = haversine_km(lon, lat)
+    lam = log(2.0)/float(half_life_km)
+    Wraw = np.exp(-lam * Dkm); np.fill_diagonal(Wraw, 0.0)
+    if cutoff_km is not None:
+        Wraw[Dkm > float(cutoff_km)] = 0.0
+    # keep only kmax strongest links per row (optional but keeps W sparse & stable)
+    neighbors, weights = {}, {}
+    for i in range(Wraw.shape[0]):
+        wrow = Wraw[i, :].copy()
+        if kmax is not None:
+            nz = np.where(wrow > 0)[0]
+            if nz.size > kmax:
+                topk = nz[np.argsort(wrow[nz])[::-1][:kmax]]
+                keep = np.zeros_like(wrow, dtype=bool); keep[topk] = True
+                wrow[~keep] = 0.0
+        idx = np.where(wrow > 0)[0]
+        neighbors[i] = idx.tolist()
+        weights[i]  = wrow[idx].tolist()
+    Wc = W(neighbors=neighbors, weights=weights)
+    Wc.transform = "R" if row_standardize else "B"
+    return Wc
+
+def panelize_W(W_country, T):
+    W_sparse = block_diag([W_country.sparse]*T, format="csr")
+    row_ptr, col_ind, data = W_sparse.indptr, W_sparse.indices, W_sparse.data
+    N = W_sparse.shape[0]; neighbors, weights = {}, {}
+    for i in range(N):
+        st, en = row_ptr[i], row_ptr[i+1]
+        cols = col_ind[st:en]; vals = data[st:en]
+        mask = cols != i
+        neighbors[i] = cols[mask].tolist()
+        weights[i]  = vals[mask].tolist()
+    Wp = W(neighbors=neighbors, weights=weights); Wp.transform = "R"
+    return Wp
+
+# --------- 2) Estimate SDM with the best W (no impacts at fit step) -----------
+# Build best country-level W (half-life 1500 km)
+Wc_best = W_country_decay_exp(df_countries, half_life_km=1500.0, cutoff_km=3000.0, kmax=20)
+T = df_bal["Year"].nunique()
+Wp_best = panelize_W(Wc_best, T)
+
+# SDM (ML_Lag with slx_lags=1); impacts disabled here -> compute below robustly
+m_sdm_best = ML_Lag(
+    y=y, x=X, w=Wp_best,
+    slx_lags=1, slx_vars="All",
+    method="full",
+    spat_impacts=None, spat_diag=True,
+    name_y="Deforestation", name_x=X_vars, name_w="W_panel"
+)
+print(f"[Best-W SDM] rho = {m_sdm_best.rho:.6f}, AIC = {getattr(m_sdm_best,'aic',np.nan):.3f}")
+
+# --- 3) Impacts with CI (robust to spreg power-expansion issues) --------------
+def parse_coeffs(model, X_vars):
+    names = list(model.name_x)
+    betas = np.asarray(model.betas).flatten()
+    # betas may or may not include rho up front depending on version; drop intercept if present
+    if betas.size == len(names) + 1:
+        betas_wo_rho = betas[1:]     # [rho, const, betas...] -> drop rho
+    else:
+        betas_wo_rho = betas.copy()
+    beta_map, theta_map, const_beta = {}, {}, None
+    for nm, b in zip(names, betas_wo_rho):
+        if nm.upper() in ("CONSTANT","CONST","INTERCEPT"):
+            const_beta = float(b); continue
+        if nm.startswith("W_"):
+            theta_map[nm[2:]] = float(b)
+        else:
+            beta_map[nm] = float(b)
+    for x in X_vars:
+        theta_map.setdefault(x, 0.0)
+    return beta_map, theta_map, const_beta
+
+def align_mean_cov(model):
+    """Return parameter mean vector & covariance in a version-robust way (ensure symmetry/PD)."""
+    cov = getattr(model, "vm", None)
+    if cov is None:
+        cov = np.asarray(model.vm1)[:-1,:-1]  # drop sigma^2 row/col
+    else:
+        cov = np.asarray(cov)
+    names = list(model.name_x)
+    bet = np.asarray(model.betas).flatten()
+    rho = float(model.rho)
+    p = cov.shape[0]
+    # Build mean vector theta_hat including rho first if needed
+    if bet.size == p:
+        if p == len(names) + 1:
+            theta_hat = np.concatenate(([rho], bet))
+            param_names = ["rho"] + names
+        else:
+            theta_hat = bet
+            param_names = names
+    elif bet.size == p - 1:
+        theta_hat = np.concatenate(([rho], bet))
+        param_names = ["rho"] + names
+    elif bet.size == p + 1:
+        theta_hat = bet[:-1]
+        param_names = names if len(theta_hat)==len(names) else (["rho"]+names)
+    else:
+        theta_hat = np.concatenate(([rho], bet[:p-1]))  # safest fallback
+        param_names = ["rho"] + names[:p-1]
+    cov = (cov + cov.T)/2.0
+    cov += 1e-12*np.eye(cov.shape[0])
+    return theta_hat, cov, param_names
+
+def build_index_maps(param_names, X_vars):
+    name_to_idx = {nm:i for i,nm in enumerate(param_names)}
+    rho_idx = name_to_idx.get("rho", None)
+    beta_idx = {x: name_to_idx.get(x, None) for x in X_vars}
+    theta_idx = {x: name_to_idx.get(f"W_{x}", None) for x in X_vars}
+    return rho_idx, beta_idx, theta_idx
+
+def impacts_for_var(rho, W, beta_j, theta_j, R=512, rng=None):
+    """Average direct / indirect / total effects via Hutchinson trace + SPLU."""
+    if rng is None:
+        rng = default_rng(42)
+    n = W.n
+    I = speye(n, format="csc")
+    Ws = W.sparse.tocsc()
+
+
+###################################################################################################
+################ Mallien vertailu
+
+# --- Helperit: Year FE -dummyt, within (country-demean), maskit SDM:lle ---
+
+import pandas as pd
+import numpy as np
+
+def make_year_dummies(df_bal, drop_first=True, prefix="Year"):
+    """Palauttaa (N x (T-1)) dataframe-dummyt vuosille balansoidun paneelin järjestyksessä."""
+    yr = df_bal["Year"].astype(int)
+    dums = pd.get_dummies(yr, prefix=prefix, drop_first=drop_first)
+    # varmistetaan sama indeksi/järjestys kuin df_bal
+    dums = dums.reset_index(drop=True)
+    return dums
+
+def within_demean_by_country(df_bal, cols):
+    """Kahdensuuntaisen FE:n 'within' osa: demean maittain (muista lisätä Year FE erikseen)."""
+    out = {}
+    for c in cols:
+        out[f"{c}_dm_c"] = (
+            df_bal[c]
+            - df_bal.groupby("Country")[c].transform("mean")
+        )
+    return pd.DataFrame(out).reset_index(drop=True)
+
+def stack_X_with_yearFE(X_df, year_dums_df, names_main):
+    """Yhdistää selittävät ja vuosidummyt; palauttaa (X_mat, name_list, slx_mask)."""
+    X_all = pd.concat([X_df.reset_index(drop=True), year_dums_df], axis=1)
+    name_x = list(names_main) + list(year_dums_df.columns)
+    # SDM: spatial-lag vain 'varsinaisiin' X:iin, EI vuosidummyihin
+    slx_mask = [True] * len(names_main) + [False] * year_dums_df.shape[1]
+    return X_all.to_numpy(float), name_x, slx_mask
+
+
+
+
+##############################################################################################################
+
+# A) SDM + Year FE (vain vuodet; ei maa‑demeanausta)
+
+from spreg import ML_Lag  # SDM via slx_lags=1  (spreg docs)  # noqa
+
+# 1) Perus X ja y ovat jo määriteltynä skriptissäsi: y, X (NO FE)  # [4](https://lukefinland-my.sharepoint.com/personal/matti_hyyrynen_luke_fi/Documents/Microsoft%20Copilot%20Chat%20-tiedostot/Biodiversity%20Python%20Code.03.txt)
+
+# 2) Vuosidummyt
+year_dums = make_year_dummies(df_bal, drop_first=True, prefix="Year")
+X_noFE_df = df_bal[X_vars].astype(float).reset_index(drop=True)
+X_yearFE, name_x_yearFE, slx_mask_yearFE = stack_X_with_yearFE(X_noFE_df, year_dums, X_vars)
+
+# 3) SDM: slx_lags=1 ja slx_vars=maski (älä spatial-lagita vuosidummyja)
+m_sdm_yearFE = ML_Lag(
+    y=y, x=X_yearFE, w=W_panel,
+    slx_lags=1, slx_vars=slx_mask_yearFE,  # tärkeää!
+    method="full",
+    spat_impacts=None,     # estimoi ensin ilman impacts-laskentaa
+    spat_diag=True,
+    name_y="Deforestation", name_x=name_x_yearFE, name_w="W_panel"
+)
+print("\n[SDM + Year FE] rho:", float(m_sdm_yearFE.rho))
+print(m_sdm_yearFE.summary)
+
+# 4) Vaikutusdekompositio (vain varsinaisille X-muuttujille)
+effects_yearFE = sdm_impacts_with_ci(
+    model=m_sdm_yearFE, W=W_panel, X_vars=X_vars,  # huom. vaikutukset vain 'X_vars'
+    M=1000, R=256, seed=123
+)
+effects_yearFE.to_csv("SDM_YearFE_impacts_ADI_AII_ATI_with_CI.csv", index=False)
+with open("SDM_YearFE_impacts_ADI_AII_ATI.tex", "w", encoding="utf-8") as f:
+    f.write(effects_yearFE.to_latex(index=False, float_format="%.3f"))
+print("✅ Tallennettu: SDM_YearFE impacts (CSV + LaTeX)")
+
+# B) SDM + TWFE (demean maittain + Year FE)
+
+# 1) Within (country-demean) y ja X
+cols_dm = ["Deforestation_Index"] + X_vars
+dm_df = within_demean_by_country(df_bal, cols_dm)
+
+# y (demean_country)
+y_twfe = dm_df["Deforestation_Index_dm_c"].to_numpy(float).reshape(-1, 1)
+
+# X (demean_country); nimet järjestyksessä X_vars
+X_twfe_df = dm_df[[f"{c}_dm_c" for c in X_vars]].copy()
+X_twfe_df.columns = X_vars  # palauta alkuperäiset nimet helpompaa tulkintaa varten
+
+# 2) lisää Year FE (drop_first=True)
+year_dums = make_year_dummies(df_bal, drop_first=True, prefix="Year")
+X_twfe, name_x_twfe, slx_mask_twfe = stack_X_with_yearFE(X_twfe_df, year_dums, X_vars)
+
+# 3) SDM (TWFE): sama rajapinta, maski estää dumppien lagituksen
+m_sdm_twfe = ML_Lag(
+    y=y_twfe, x=X_twfe, w=W_panel,
+    slx_lags=1, slx_vars=slx_mask_twfe,
+    method="full",
+    spat_impacts=None,
+    spat_diag=True,
+    name_y="Deforestation(TWFE)", name_x=name_x_twfe, name_w="W_panel"
+)
+print("\n[SDM + TWFE] rho:", float(m_sdm_twfe.rho))
+print(m_sdm_twfe.summary)
+
+# 4) Vaikutusdekompositio (vain 'varsinaiset' X:t)
+effects_twfe = sdm_impacts_with_ci(
+    model=m_sdm_twfe, W=W_panel, X_vars=X_vars,
+    M=1000, R=256, seed=123
+)
+effects_twfe.to_csv("SDM_TWFE_impacts_ADI_AII_ATI_with_CI.csv", index=False)
+with open("SDM_TWFE_impacts_ADI_AII_ATI.tex", "w", encoding="utf-8") as f:
+    f.write(effects_twfe.to_latex(index=False, float_format="%.3f"))
+print("✅ Tallennettu: SDM_TWFE impacts (CSV + LaTeX)")
+
+
+############################################################################
+########### Mallien vertailu 
+
+import numpy as np
+import pandas as pd
+
+def collect_model_stats(tag, m):
+    return {
+        "Model": tag,
+        "rho": float(m.rho),
+        "AIC": float(getattr(m, "aic", np.nan)),
+        "LogLik": float(getattr(m, "logll", np.nan)),
+        "PseudoR2": float(getattr(m, "pr2_e", np.nan)),
+        "n": int(m.n)
+    }
+
+rows = []
+rows.append(collect_model_stats("SDM_NO_FE", m_sdm_ml))         # nykyinen perusmalli
+rows.append(collect_model_stats("SDM_YearFE", m_sdm_yearFE))
+rows.append(collect_model_stats("SDM_TWFE", m_sdm_twfe))
+comp = pd.DataFrame(rows)
+comp.to_csv("SDM_FE_comparison.csv", index=False)
+print("\n=== SDM FE ‑vertailu ===")
+print(comp)
+
+
+def export_impacts_tables(tag, model, W, X_vars, M=1000, R=256, seed=123, decimals=3):
+    df = sdm_impacts_with_ci(model=model, W=W, X_vars=X_vars, M=M, R=R, seed=seed)
+    csv_name = f"{tag}_impacts_ADI_AII_ATI_with_CI.csv"
+    tex_name = f"{tag}_impacts_ADI_AII_ATI_with_CI.tex"
+    df.to_csv(csv_name, index=False)
+    with open(tex_name, "w", encoding="utf-8") as f:
+        f.write(df.to_latex(index=False, float_format=f"%.{decimals}f"))
+    print("✅ saved:", csv_name, "and", tex_name)
+    return df
+
+# Baseline NO-FE (use whichever one you trust for cov matrix; m_sdm_imp is fine)
+effects_noFE = export_impacts_tables("SDM_NO_FE", m_sdm_imp, W_panel, X_vars)
+
+# Year FE
+effects_yearFE = export_impacts_tables("SDM_YearFE", m_sdm_yearFE, W_panel, X_vars)
+
+# TWFE
+effects_twfe = export_impacts_tables("SDM_TWFE", m_sdm_twfe, W_panel, X_vars)
+
+
+
+
+
+
+
+
+
+
+
+
+
+#################################################################################################
+
+# ================================================================
+# CLEAN & WORKING PIPELINE FOR BASE–LOGY–PERKM2 SDM MODELS
+# ================================================================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from spreg import ML_Lag
+
+# ----------------------------
+# 1. DEPENDENT VARIABLES
+# ----------------------------
+y_base   = df_bal["Deforestation_Index"].to_numpy(float).reshape(-1,1)
+y_log1p  = np.log1p(y_base)
+y_perkm2 = (y_base / df_bal["Forest_Area"].to_numpy(float).reshape(-1,1))
+
+# ----------------------------
+# 2. SDM MODEL RUNNER (simple)
+# ----------------------------
+def run_sdm(y_vec, tag):
+    print(f"\n=== RUNNING SDM FOR {tag} ===")
+    m = ML_Lag(
+        y=y_vec,
+        x=X,                      # your explanatory matrix
+        w=W_panel,
+        slx_lags=1,
+        slx_vars="All",
+        method="full",
+        spat_impacts="simple",
+        spat_diag=True,
+        name_y=f"Y_{tag}",
+        name_x=X_vars,
+        name_w="W_panel"
+    )
+    print(m.summary)
+    return m
+
+m_base   = run_sdm(y_base,   "BASE")
+m_logy   = run_sdm(y_log1p,  "LOGY")
+m_perkm2 = run_sdm(y_perkm2, "PERKM2")
+
+
+# ================================================================
+# 3. STANDARDIZED COEFFICIENTS  (β* = β * sd(X_j) / sd(Y))
+# ================================================================
+
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+def extract_standardized_safe(m, y_vec, X, label):
+    """
+    Standardized coefficients β* for BASE / LOGY / PERKM2.
+    This version avoids ALL shape problems:
+    - Standardizes only the ORIGINAL X_vars (not WX terms)
+    - Uses beta_j only for matching original X_vars
+    """
+    names = list(m.name_x)
+
+    # Only keep coefficients for the ORIGINAL X variables
+    mask = [v in X_vars for v in names]   # X_vars is your original list
+
+    betas = np.asarray(m.betas).flatten()[mask]
+    names_keep = [nm for nm, keep in zip(names, mask) if keep]
+
+    # sd(X_j) from your original X
+    sd_x = X.std(axis=0)
+
+    # sd(Y) from model's dependent vector
+    sd_y = np.asarray(m.y).std(ddof=1)
+
+    beta_std = betas * (sd_x / sd_y)
+
+    # z statistics → p-values
+    z_vals = []
+    for row in m.z_stat:
+        if len(row) >= 2:
+            z_vals.append(float(row[1]))
+        else:
+            z_vals.append(np.nan)
+    z_vals = np.asarray(z_vals)[mask]
+    pvals = 2*(1 - norm.cdf(np.abs(z_vals)))
+
+    return pd.DataFrame({
+        "Variable": names_keep,
+        f"{label}_beta_std": beta_std,
+        f"{label}_p": pvals
+    })
+
+
+
+df_base_std   = extract_standardized_safe(m_base,   y_base,   X, "BASE")
+df_logy_std   = extract_standardized_safe(m_logy,   y_log1p,  X, "LOGY")
+df_perkm2_std = extract_standardized_safe(m_perkm2, y_perkm2, X, "PERKM2")
+
+
+
+df_std = (df_base_std
+          .merge(df_logy_std,   on="Variable", how="outer")
+          .merge(df_perkm2_std, on="Variable", how="outer"))
+
+
+
+def stars(p):
+    if p < 0.001: return "***"
+    if p < 0.01:  return "**"
+    if p < 0.05:  return "*"
+    if p < 0.10:  return "."
+    return ""
+
+for col in ["BASE","LOGY","PERKM2"]:
+    df_std[f"{col}_sig"] = df_std[f"{col}_p"].apply(stars)
+
+
+
+beta_cols = [c for c in df_std.columns if c.endswith("_beta_std")]
+df_std["avg_abs"] = np.nanmean(np.abs(df_std[beta_cols]), axis=1)
+df_std = df_std.sort_values("avg_abs", ascending=False).reset_index(drop=True)
+
+df_std
+
+
+# build final table
+df_std_table = df_std[[
+    "Variable",
+    "BASE_beta_std","BASE_sig",
+    "LOGY_beta_std","LOGY_sig",
+    "PERKM2_beta_std","PERKM2_sig"
+]].reset_index(drop=True)
+
+print("=== STANDARDIZED COEFFICIENT TABLE ===")
+display(df_std_table.head(20))
+
+df_std_table.to_csv("SDM_standardized_scaling_comparison.csv", index=False)
+
+
+
+
+
+##################################################################################
+##################################################################################
+# Laajennus: pysyvä vs. väliaikainen metsäkato
+
+y_perm = df_bal["DefPermanent"].to_numpy(float).reshape(-1,1)
+y_temp = df_bal["DefTemporary"].to_numpy(float).reshape(-1,1)
+
+
+m_perm = ML_Lag(
+    y=y_perm, x=X, w=W_panel,
+    slx_lags=1, slx_vars="All",
+    method="full", spat_impacts="simple",
+    name_y="DefPermanent",
+    name_x=X_vars,
+    name_w="W_panel"
+)
+
+m_temp = ML_Lag(
+    y=y_temp, x=X, w=W_panel,
+    slx_lags=1, slx_vars="All",
+    method="full", spat_impacts="simple",
+    name_y="DefTemporary",
+    name_x=X_vars,
+    name_w="W_panel"
+)
+
+print(m_perm.summary)
+print(m_temp.summary)
+
+##############################################################################
+# Python Code: Unified Parameter Table for All Three Models
+
+
+import numpy as np
+import pandas as pd
+
+def extract_params(model, model_name):
+    """
+    Robust extraction of coefficients, std.err, z-scores, p-values
+    from spreg.ML_Lag objects, compatible across PySAL versions.
+    Returns DataFrame with:
+       Variable | Coef | StdErr | z | p | Model
+    """
+
+    # --- 1. Model parameter names (including WX terms) ---
+    names = list(model.name_x)
+
+    # --- 2. Coefficients, StdErrs directly ---
+    coef = np.asarray(model.betas).flatten()
+    stderr = np.asarray(model.std_err).flatten()
+
+    # --- 3. z-stat and p-values ---
+    # model.z_stat is a list-of-lists: [coef, z, p]
+    z = np.array([row[1] for row in model.z_stat])
+    p = np.array([row[2] for row in model.z_stat])
+
+    # --- 4. Add rho manually if not included ---
+    # Some spreg versions keep rho separate from betas
+    if hasattr(model, "rho") and "W_y" not in names:
+        names = ["W_y"] + names
+        coef = np.insert(coef, 0, model.rho)
+        stderr = np.insert(stderr, 0, model.std_err[0])
+        z = np.insert(z, 0, model.z_stat[0][1])
+        p = np.insert(p, 0, model.z_stat[0][2])
+
+    # --- Build DF ---
+    df = pd.DataFrame({
+        "Variable": names,
+        f"{model_name}_Coef": coef,
+        f"{model_name}_StdErr": stderr,
+        f"{model_name}_z": z,
+        f"{model_name}_p": p
+    })
+
+    return df
+
+
+
+import numpy as np
+import pandas as pd
+
+def extract_params(model, model_name):
+    """
+    Version-robust extraction of coefficient table from spreg.ML_Lag.
+    Returns: DataFrame with columns:
+      Variable | <name>_Coef | <name>_StdErr | <name>_z | <name>_p
+    Notes:
+      - Handles cases where z_stat has only (coef, z) and no p-value.
+      - Adds rho as 'W_y' if not already in name_x.
+      - Prints diagnostics if vector lengths mismatch.
+    """
+
+    # ---- 1) Core arrays ----
+    names = list(model.name_x)                     # regressors (includes WX, constant label if present)
+    betas = np.asarray(model.betas).flatten()      # coefficients (no rho in most spreg builds)
+    se    = np.asarray(model.std_err).flatten()    # std errors (same count as betas + possibly rho as first? varies)
+    zraw  = model.z_stat                           # list-like, rows are [coef, z] or [coef, z, p]
+    # Normalize z and p safely
+    z = []
+    p = []
+    for row in zraw:
+        # Some versions give tuples like (coef, z) or (coef, z, p)
+        try:
+            # ensure indexable
+            r = list(row)
+        except Exception:
+            r = [np.nan, np.nan, np.nan]
+        # z at index 1 if present
+        z_val = r[1] if len(r) >= 2 else np.nan
+        # p at index 2 if present
+        p_val = r[2] if len(r) >= 3 else np.nan
+        z.append(z_val)
+        p.append(p_val)
+    z = np.asarray(z).flatten()
+    p = np.asarray(p).flatten()
+
+    # ---- 2) Decide whether rho (W_y) is already inside or must be prepended ----
+    # In many spreg versions, betas excludes rho and z_stat includes an extra first row for rho
+    # Heuristics:
+    #   - If model has attribute 'rho' and 'W_y' not in names, we will prepend it.
+    #   - We also try to align se/z/p lengths when prepending.
+    add_rho = hasattr(model, "rho") and ("W_y" not in names)
+
+    # Build aligned lists for names / coef / se / z / p (without rho yet)
+    coef = betas.copy()
+    std  = se.copy()
+    zvec = z.copy()
+    pvec = p.copy()
+
+    # If z_stat length == betas length + 1, assume first row corresponds to rho
+    rho_from_z = None
+    if add_rho and (len(zvec) == len(coef) + 1):
+        rho_from_z = 0  # index 0 is rho row in z_stat arrays
+
+    # Some builds also put std_err for rho as the first element; we guard against length mismatch.
+    if add_rho:
+        # Rho coefficient
+        rho_coef = float(model.rho)
+        # Try to fetch rho se/z/p if we detected a separate row
+        if rho_from_z is not None:
+            rho_z  = float(zvec[0]) if len(zvec) > 0 else np.nan
+            rho_p  = float(pvec[0]) if len(pvec) > 0 else np.nan
+            # std err for rho is not always exposed cleanly; try to take the first if lengths align, else NaN
+            rho_se = float(std[0]) if len(std) == (len(coef) + 1) else np.nan
+            # Now drop that first entry from z/p/se vectors so lengths match betas
+            zvec = zvec[1:] if len(zvec) > 0 else zvec
+            pvec = pvec[1:] if len(pvec) > 0 else pvec
+            if len(std) == (len(coef) + 1):
+                std = std[1:]
+        else:
+            # Could not detect dedicated rho row; set to NaN where unknown
+            rho_se = np.nan
+            rho_z  = np.nan
+            rho_p  = np.nan
+
+        # Prepend to lists
+        names = ["W_y"] + names
+        coef  = np.insert(coef, 0, rho_coef)
+        std   = np.insert(std,  0, rho_se)
+        zvec  = np.insert(zvec, 0, rho_z)
+        pvec  = np.insert(pvec, 0, rho_p)
+
+    # ---- 3) Basic sanity checks (helpful to debug once, then disable) ----
+    if not (len(names) == len(coef) == len(std) == len(zvec) == len(pvec)):
+        print(f"[WARN] Length mismatch in {model_name}: "
+              f"names={len(names)}, coef={len(coef)}, se={len(std)}, z={len(zvec)}, p={len(pvec)}")
+        # Attempt to truncate/pad to the shortest common length
+        L = min(len(names), len(coef), len(std), len(zvec), len(pvec))
+        names = names[:L]; coef = coef[:L]; std = std[:L]; zvec = zvec[:L]; pvec = pvec[:L]
+
+    # ---- 4) Build DataFrame ----
+    df = pd.DataFrame({
+        "Variable": names,
+        f"{model_name}_Coef":   coef.astype(float),
+        f"{model_name}_StdErr": std.astype(float),
+        f"{model_name}_z":      zvec.astype(float),
+        f"{model_name}_p":      pvec.astype(float)
+    })
+    return df
+
+#####################################################################
+
+
+
+#  Python‑koodi: vertailutaulukko SDM‑malleille
+
+import pandas as pd
+import numpy as np
+
+def collect_sdm_stats(model, tag):
+    """
+    Extract comparable model statistics from SDM (ML_Lag) object.
+    Works with your current spreg setup.
+    """
+
+    # Safely extract all stats (if attribute missing -> np.nan)
+    def safe_attr(obj, name):
+        return float(getattr(obj, name, np.nan)) if hasattr(obj, name) else np.nan
+
+    out = {
+        "Model": tag,
+        "rho": float(model.rho),
+        "AIC": safe_attr(model, "aic"),
+        "LogLik": safe_attr(model, "logll"),
+        "PseudoR2": safe_attr(model, "pr2_e"),
+        "N": int(model.n)
+    }
+    return out
+
+# ---- Build comparison table ----
+rows = []
+rows.append(collect_sdm_stats(m_sdm_ml,  "SDM_original"))
+rows.append(collect_sdm_stats(m_perm,    "SDM_permanent"))
+rows.append(collect_sdm_stats(m_temp,    "SDM_temporary"))
+
+df_compare = pd.DataFrame(rows)
+
+# Reorder columns
+df_compare = df_compare[["Model", "rho", "AIC", "LogLik", "PseudoR2", "N"]]
+
+# Show
+print("\n=== SDM Comparison Table ===")
+display(df_compare)
+
+# Save
+df_compare.to_csv("SDM_comparison_perm_temp_original.csv", index=False)
+print("Saved: SDM_comparison_perm_temp_original.csv")
+
+#########################################################################
+# kolme mallia → yksi yhteinen vaikutustaulukko
+
+import pandas as pd
+import numpy as np
+
+# -----------------------------
+# Helper: compute impacts table
+# -----------------------------
+def compute_impacts(model, tag, W_panel, X_vars, M=1000, R=256, seed=123):
+    """
+    Laskee ADI/AII/ATI + 95% CI annetulle mallille.
+    Palauttaa DataFramen, jossa sarakkeet:
+    Variable, Direct, Indirect, Total, Direct_CI_L, Direct_CI_U, jne.
+    """
+    df_imp = sdm_impacts_with_ci(
+        model=model,
+        W=W_panel,
+        X_vars=X_vars,
+        M=M,
+        R=R,
+        seed=seed
+    ).copy()
+
+    # Lisää mallin tunniste
+    df_imp["Model"] = tag
+
+    return df_imp
+
+
+# ------------------------------------
+# Computing impacts separately
+# ------------------------------------
+imp_orig = compute_impacts(
+    m_sdm_ml, "SDM_original",
+    W_panel, X_vars
+)
+
+imp_perm = compute_impacts(
+    m_perm, "SDM_permanent",
+    W_panel, X_vars
+)
+
+imp_temp = compute_impacts(
+    m_temp, "SDM_temporary",
+    W_panel, X_vars
+)
+
+
+# -----------------------------
+# Yhdistä kolmen mallin taulukot
+# -----------------------------
+df_imp_all = pd.concat([imp_orig, imp_perm, imp_temp], axis=0)
+
+# Halutessa järjestys: ensin malli, sitten muuttuja
+df_imp_all = df_imp_all[[
+    "Model", "Variable",
+    "Direct", "Direct_CI_L", "Direct_CI_U",
+    "Indirect", "Indirect_CI_L", "Indirect_CI_U",
+    "Total", "Total_CI_L", "Total_CI_U"
+]]
+
+# -----------------------------
+# Näytä ja tallenna
+# -----------------------------
+print("\n=== IMPACT COMPARISON: ORIGINAL vs PERMANENT vs TEMPORARY ===")
+display(df_imp_all)
+
+df_imp_all.to_csv("SDM_impacts_comparison_original_perm_temp.csv", index=False)
+print("Saved: SDM_impacts_comparison_original_perm_temp.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################################################################
+############################ Endogeenisuus ja kausaalinen identifiointi (GS2SLS)
+#########################################################################################################
+
+
+
+
+# ============================================================
+# FAIL-SAFE GS2SLS PIPELINE (cross-sectional, single cell)
+# ============================================================
+
+import numpy as np
+import pandas as pd
+from libpysal.weights import KNN, W
+from spreg import GM_Lag
+
+def _dbg(msg):
+    print(f"[GS2SLS-DBG] {msg}")
+
+# -----------------------------------------------
+# 1) Valitse CROSS-SECTION (viimeisin vuosi)
+# -----------------------------------------------
+last_year = df_bal["Year"].max()
+df_xs = (
+    df_bal[df_bal["Year"] == last_year]
+    .sort_values("Country")
+    .reset_index(drop=True)
+)
+
+_dbg(f"Using cross-sectional slice from year {last_year}")
+_dbg(f"Rows = {df_xs.shape[0]}")
+
+# -----------------------------------------------
+# 2) Rakenna CROSS-SECTIONAL W (EI panelisointia!)
+# -----------------------------------------------
+df_c = df_xs[["Country","Longitude","Latitude"]].drop_duplicates("Country")
+df_c = df_c.sort_values("Country").reset_index(drop=True)
+
+# 3D coords
+lon = np.deg2rad(df_c["Longitude"].to_numpy())
+lat = np.deg2rad(df_c["Latitude"].to_numpy())
+coords3 = np.column_stack([
+    np.cos(lat)*np.cos(lon),
+    np.cos(lat)*np.sin(lon),
+    np.sin(lat)
+])
+
+# KNN W
+k = 12
+W_cross = KNN.from_array(coords3, k=min(k, df_c.shape[0]-1))
+W_cross.transform = "R"
+
+_dbg(f"Cross-sectional W built: n = {W_cross.n}")
+
+# -----------------------------------------------
+# 3) Aja matriisit GS2SLS:lle
+# -----------------------------------------------
+y_gs = df_xs["Deforestation_Index"].to_numpy().reshape(-1,1)
+X_gs = df_xs[X_vars].to_numpy()
+
+# Spatial instrument WX
+WX_gs = W_cross.sparse @ X_gs
+
+# Lagged IV (lag from the panel)
+df_xs["Corruption_lag1"] = (
+    df_bal.sort_values(["Country","Year"])
+          .groupby("Country")["Corruption_Control"]
+          .shift(1)
+)
+
+df_xs["Corruption_lag1"] = df_xs["Corruption_lag1"].fillna(
+    df_xs["Corruption_Control"].mean()
+)
+
+Z_ext = df_xs["Corruption_lag1"].to_numpy().reshape(-1,1)
+
+# Instruments = [WX, lagged IV]
+instruments = np.column_stack([WX_gs, Z_ext])
+
+_dbg("Shapes:")
+_dbg(f"y: {y_gs.shape}, X: {X_gs.shape}, WX: {WX_gs.shape}, Z_ext: {Z_ext.shape}")
+
+# -----------------------------------------------
+# 4) GS2SLS (GM_Lag)
+# -----------------------------------------------
+_dbg("Estimating GS2SLS...")
+
+m_gs2sls = GM_Lag(
+    y = y_gs,
+    x = X_gs,
+    w = W_cross,
+    w_lags = 1,
+    instruments = instruments,
+    spat_diag = True,
+    name_y = "Deforestation",
+    name_x = X_vars,
+    name_w = "W_cross",
+    name_g = "GS2SLS"
+)
+
+print(m_gs2sls.summary)
+print("NOTE: PySAL GM_Lag does not expose Sargan/Hansen tests.")
+print("If needed, I can compute the Hansen J-test manually.")
+
+######################################################################
+# Laajennetut WX–instrumentit (W·X, W²·X, W³·X)
+# Spatial instrument WX
+# ======================================================# EXTENDED INSTRUMENT SET: WX, W²X, W³X + lagged IV# ======================================================
+# 1) First-order spatial lag WX = W X
+WX1 = W_cross.sparse @ X_gs          # shape: (n × k)
+
+# 2) Second-order spatial lag W²X = W (W X)
+WX2 = W_cross.sparse @ WX1           # shape: (n × k)
+
+# 3) Third-order spatial lag W³X = W (W² X)
+WX3 = W_cross.sparse @ WX2           # shape: (n × k)
+
+# 4) External IV (lagged corruption)
+Z_ext = df_xs["Corruption_lag1"].to_numpy().reshape(-1,1)
+
+# 5) Combine all instruments horizontally#    Instruments = [W X, W² X, W³ X, Z_ext]instruments = np.column_stack([WX1, WX2, WX3, Z_ext])
+
+print("Instrument matrix shape:", instruments.shape)
+
+
+# Run GS2SLS with extended instrument set
+m_gs2sls = GM_Lag(
+    y = y_gs,
+    x = X_gs,
+    w = W_cross,
+    w_lags = 1,
+    instruments = instruments,
+    spat_diag = False,    # (spreg ei tee Sargan/Hansen testiä)
+    name_y = "Deforestation",
+    name_x = X_vars,
+    name_w = "W_cross",
+    name_g = "GS2SLS_ext"
+)
+
+print(m_gs2sls.summary)
+
+
+# Sargan/Hansen–testi nyt toimii
+
+results = sargan_hansen_gs2sls(
+    model = m_gs2sls,
+    instruments = instruments,
+    X = X_gs,
+    include_constant = True
+)
+
+print("=== Hansen–Sargan Test ===")
+print(f"J-statistic: {results['J']:.4f}")
+print(f"df: {results['df']}")
+print(f"p-value: {results['p_value']:.5f}")
+print(f"Instrument validity: {'ACCEPTED' if results['valid'] else 'REJECTED'}")
+
+
+
+import numpy as np
+from numpy.linalg import inv
+from scipy.stats import chi2
+
+def sargan_hansen_gs2sls_rank(
+    model,
+    instruments,     # Z: (n × q)
+    X,               # X: (n × k)  (ei vakiosaraketta)
+    y,               # y: (n × 1)
+    W,               # cross-sectional W (libpysal W), not panel!
+    add_constant=True,
+    verbose=True
+):
+    """
+    Hansen–Sargan over-ID test GM_Lag/GS2SLS: J = u'Z(Z'Z)^(-1)Z'u,
+    df = rank(Z) - rank([1, X, Wy_hat]).
+
+    Wy_hat = P_Z Wy, missä Wy = W * y; P_Z = Z (Z'Z)^(-1) Z'.
+
+    Palauttaa dict: {J, df, p_value, ranks, shapes}
+    """
+
+    # --- muotoon (n,1) ---
+    u = np.asarray(model.u).reshape(-1, 1)
+    Z = np.asarray(instruments)
+    X = np.asarray(X)
+    y = np.asarray(y).reshape(-1, 1)
+
+    n = Z.shape[0]
+    if u.shape[0] != n or X.shape[0] != n or y.shape[0] != n:
+        raise ValueError("Dimensio-ongelma: u, Z, X, y eivät ole samankorkuisia.")
+
+    # --- Wy ja sen projektiot instrumentteihin (ensimmäisen vaiheen fitted) ---
+    Wy = W.sparse @ y                      # (n × 1)
+    S = Z.T @ Z                            # (q × q)
+    S_inv = inv(S)
+    Pz = Z @ S_inv @ Z.T                   # (n × n)
+    Wy_hat = Pz @ Wy                       # (n × 1)
+
+    # --- Rakenna mallin regressori-matriisi rankin arviointiin: [1, X, Wy_hat] ---
+    if add_constant:
+        ones = np.ones((n, 1))
+        X_aug = np.column_stack([ones, X, Wy_hat])
+    else:
+        X_aug = np.column_stack([X, Wy_hat])
+
+    # --- J-statistiikka ---
+    g = Z.T @ u                            # (q × 1)
+    J_val = float(np.squeeze(g.T @ S_inv @ g))  # puristus skalariksi
+
+    # --- Rank-pohjainen df ---
+    # Huom: np.linalg.matrix_rank käyttää SVD-pohjaista tol-arviota — hyvin robusti.
+    rank_Z = np.linalg.matrix_rank(Z)
+    rank_X = np.linalg.matrix_rank(X_aug)
+    df = int(rank_Z - rank_X)
+
+    if verbose:
+        print("[SARGAN] ranks:", {"rank_Z": rank_Z, "rank_X_aug": rank_X})
+        print("[SARGAN] shapes:", {"Z": Z.shape, "X": X.shape, "Wy_hat": Wy_hat.shape, "X_aug": X_aug.shape})
+        print(f"[SARGAN] computed df = {df}")
+
+    if df <= 0:
+        raise ValueError(
+            f"Degrees of freedom <= 0 (df={df}). "
+            "Tämä tarkoittaa, että efektiivisiä (rank) instrumentteja ei ole yli regressori-rankin. "
+            "Ratkaisu: lisää instrumentteja (esim. W^4 X) tai poista kollineaarisia sarakkeita Z:stä."
+        )
+
+    p_value = 1.0 - chi2.cdf(J_val, df)
+
+    return {
+        "J": float(J_val),
+        "df": df,
+        "p_value": float(p_value),
+        "ranks": {"rank_Z": int(rank_Z), "rank_X_aug": int(rank_X)},
+        "shapes": {"Z": Z.shape, "X": X.shape, "Wy_hat": Wy_hat.shape, "X_aug": X_aug.shape}
+    }
+
+
+
+
+
+
+
+######################################################################
+###################### Koodiblokki: Dynaamisen SDM:n toteutus ########
+
+
+def build_dynamic_sdm(df_bal, W_panel, X_vars):
+    """
+    Rakentaa puhtaan dynaamisen SDM-paneelin:
+    - järjestää paneelin
+    - luo row_id
+    - rakentaa df_dyn (lag + differenssit)
+    - luo Wp_dyn = W_panel subsetoituna df_dyn:n rivijoukkoon
+    - laskee dWy, dWy_lag, dW* kaikille X_vars muuttujille
+    Palauttaa df_dyn, Wp_dyn, rows
+    """
+
+    import numpy as np
+    import pandas as pd
+    from scipy.sparse import csr_matrix
+
+    # ============================================================
+    # 1. PUHDAS df_bal (oletus: tämä on jo balanced panel)
+    # ============================================================
+    df_bal = df_bal.sort_values(["Year", "Country"]).reset_index(drop=True)
+
+    # Luo yksi puhdas row_id joka vastaa suoraan W_panel-järjestystä
+    df_bal = df_bal.drop(columns=[c for c in df_bal.columns if "row_id" in c], 
+                         errors="ignore")
+    df_bal["row_id"] = np.arange(df_bal.shape[0], dtype=np.int64)
+
+    # ============================================================
+    # 2. RAKENNA PUHDAS df_dyn
+    # ============================================================
+    cols = ["Country", "Year", "row_id", "Deforestation_Index"] + X_vars
+    df_dyn = df_bal[cols].copy()
+
+    # Lag y_{t-1}
+    df_dyn["y_lag"] = df_dyn.groupby("Country")["Deforestation_Index"].shift(1)
+
+    # Poista ensimmäiset vuodet mailta
+    df_dyn = df_dyn.dropna(subset=["y_lag"]).reset_index(drop=True)
+
+    # ============================================================
+    # 3. KRITTINEN JÄRJESTYS (Country, Year)
+    # ============================================================
+    df_dyn = df_dyn.sort_values(["Country","Year"]).reset_index(drop=True)
+
+    # ============================================================
+    # 4. DIFFERENSSIT (dy, dy_lag, dX)
+    # ============================================================
+
+    def diff_by_country(df, col):
+        return df.groupby("Country")[col].diff()
+
+    df_dyn["dy"]     = diff_by_country(df_dyn, "Deforestation_Index")
+    df_dyn["dy_lag"] = diff_by_country(df_dyn, "y_lag")
+
+    for var in X_vars:
+        df_dyn[f"d{var}"] = diff_by_country(df_dyn, var)
+
+    # Sanity check
+    if df_dyn["dy"].isna().all():
+        raise RuntimeError("dy on kokonaan NaN — tarkista järjestys (Country, Year).")
+
+    # ============================================================
+    # 5. Rakenna rows = df_dyn:n row_id (1D, int)
+    # ============================================================
+    rows = df_dyn["row_id"].to_numpy().astype(np.int64)
+    n_dyn = df_dyn.shape[0]
+    W_all = W_panel.sparse.tocsr()
+
+    # ============================================================
+    # 6. SUBSETOI W_panel → Wp_dyn (täsmälleen df_dyn-järjestys)
+    # ============================================================
+    Wp_dyn = W_all[rows][:, rows]
+
+    # ============================================================
+    # 7. SPATIAALILAGIT DYNAAMISILLE EROILLE (dWy, dW*, ...)
+    # ============================================================
+    dy_vec     = df_dyn["dy"].to_numpy().reshape(-1)
+    dy_lag_vec = df_dyn["dy_lag"].to_numpy().reshape(-1)
+
+    df_dyn["dWy"]     = Wp_dyn @ dy_vec
+    df_dyn["dWy_lag"] = Wp_dyn @ dy_lag_vec
+
+    for var in X_vars:
+        xvec = df_dyn[f"d{var}"].to_numpy().reshape(-1)
+        df_dyn[f"dW{var}"] = Wp_dyn @ xvec
+
+    return df_dyn, Wp_dyn, rows
+
+
+
+# -------------------------------------------
+
+# 1. Rakennetaan estimation matrix
+# -------------------------------------------
+
+
+def run_dynamic_sdm(df_dyn, Wp_dyn, X_vars):
+
+    # 1. Estimation matrix
+    dy_vec     = df_dyn["dy"].to_numpy().reshape(-1,1)
+    dy_lag_vec = df_dyn["dy_lag"].to_numpy().reshape(-1,1)
+    dWy_vec    = df_dyn["dWy"].to_numpy().reshape(-1,1)
+
+    dX  = np.column_stack([df_dyn[f"d{v}"].to_numpy()  for v in X_vars])
+    dWX = np.column_stack([df_dyn[f"dW{v}"].to_numpy() for v in X_vars])
+
+    Xmat = np.column_stack([dy_lag_vec, dWy_vec, dX, dWX])
+
+
+    # -------------------------------------------
+    # 2. Rakennetaan instrumentit (Arellano–Bond)
+    # -------------------------------------------
+
+    # perusasetus:
+    # käytetään tasolagien lags2, lags3 instrumentteja
+    df_dyn["y_lag2"] = df_dyn.groupby("Country")["y_lag"].shift(1)
+    df_dyn["y_lag3"] = df_dyn.groupby("Country")["y_lag"].shift(2)
+
+    instr = df_dyn[["y_lag2","y_lag3"]].dropna().to_numpy()
+
+    # pudotetaan rivit, joissa instrumentti puuttuu
+    valid = ~np.isnan(df_dyn["y_lag2"]) & ~np.isnan(df_dyn["y_lag3"])
+    dy_vec     = dy_vec[valid]
+    Xmat       = Xmat[valid]
+    instr      = instr
+    Wp_valid   = Wp_dyn[valid][:, valid]
+
+    # -------------------------------------------
+    # 3. GMM-estimointi (GM_Lag)
+    # -------------------------------------------
+    dyn_gmm = GM_Lag(
+        y      = dy_vec,
+        x      = Xmat,
+        w      = Wp_valid,
+        instruments = instr,
+        name_y = "dy",
+        name_x = ["dy_lag","dWy"] + [f"d{v}" for v in X_vars] + [f"dW{v}" for v in X_vars],
+        w_lags = 0,
+        lag_q  = 1,
+    )
+
+    # -------------------------------------------
+    # 4. Parametrien purku
+    # -------------------------------------------
+
+    params = dyn_gmm.betas.flatten()
+
+    # φ (persistent effect) = coefficient of dy_lag
+    phi = params[0]
+
+    # spatial rho (short-run)
+    rho = params[1]
+
+    # β (short-run)
+    k = len(X_vars)
+    beta  = params[2:2+k]
+    theta = params[2+k:2+2*k]
+
+    # -------------------------------------------
+    # 5. Lyhyen aikavälin vaikutukset (SR)
+    # -------------------------------------------
+    # SR_total_j = (I - rho W)^(-1) (β_j + θ_j W)  evaluated as average impacts
+    # Käytetään LeSage-Pace / Elhorst (2014) rotaatiota:
+
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import splu
+
+    n = Wp_valid.shape[0]
+    I = sp.eye(n, format="csr")
+    A = (I - rho * Wp_valid)
+    A_inv = splu(A)
+
+    # Short-run impacts:
+    sr_direct   = []
+    sr_indirect = []
+    sr_total    = []
+
+    # Hutchinson trace estimator
+    R = 200
+    rng = np.random.default_rng(123)
+
+    z = rng.choice([-1.0, 1.0], size=(n, R))
+    Sz = A_inv.solve(z)
+    trace_Ainv = (z * Sz).sum(axis=0).mean()
+
+    Wz  = Wp_valid @ z
+    SWz = A_inv.solve(Wz)
+    trace_AinvW = (z * SWz).sum(axis=0).mean()
+
+    for j in range(k):
+        b = beta[j]
+        t = theta[j]
+
+        # short-run total effect (average)
+        M1   = b*np.ones((n,1)) + t*(Wp_valid @ np.ones((n,1)))
+        SM1  = A_inv.solve(M1)
+        tot  = float(SM1.mean())
+
+        # direct
+        direct = (b * trace_Ainv + t * trace_AinvW) / n
+        indirect = tot - direct
+
+        sr_direct.append(direct)
+        sr_indirect.append(indirect)
+        sr_total.append(tot)
+
+    sr_effects = pd.DataFrame({
+        "Variable": X_vars,
+        "SR_direct":   sr_direct,
+        "SR_indirect": sr_indirect,
+        "SR_total":    sr_total
+    })
+
+    # -------------------------------------------
+    # 6. Pitkän aikavälin vaikutukset (LR)
+    # -------------------------------------------
+    # LR = SR * (1 / (1 - phi))
+    # (Elhorst 2014, dynamic SDM steady-state)
+
+    lr_effects = sr_effects.copy()
+    lr_effects["LR_direct"]   = lr_effects["SR_direct"]   * (1.0 / (1.0 - phi))
+    lr_effects["LR_indirect"] = lr_effects["SR_indirect"] * (1.0 / (1.0 - phi))
+    lr_effects["LR_total"]    = lr_effects["SR_total"]    * (1.0 / (1.0 - phi))
+
+    return dyn_gmm, sr_effects, lr_effects
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+from spreg import GM_Lag
+from libpysal.weights import W
+
+
+# ---------------------------------
+# 1) Build lagged dependent variable
+# ---------------------------------
+
+df_bal = df_bal.sort_values(["Year","Country"]).reset_index(drop=True)
+df_bal = df_bal.drop(columns=[c for c in df_bal.columns if "row_id" in c], errors="ignore")
+df_bal["row_id"] = np.arange(df_bal.shape[0], dtype=np.int64)
+
+cols = ["Country","Year","row_id","Deforestation_Index"] + X_vars
+df_dyn = df_bal[cols].copy()
+
+df_dyn["y_lag"] = df_dyn.groupby("Country")["Deforestation_Index"].shift(1)
+df_dyn = df_dyn.dropna(subset=["y_lag"]).reset_index(drop=True)
+
+df_dyn = df_dyn.sort_values(["Country","Year"]).reset_index(drop=True)
+
+def diff_by_country(df, col):
+    return df.groupby("Country")[col].diff()
+
+df_dyn["dy"]     = diff_by_country(df_dyn, "Deforestation_Index")
+df_dyn["dy_lag"] = diff_by_country(df_dyn, "y_lag")
+
+for var in X_vars:
+    df_dyn[f"d{var}"] = diff_by_country(df_dyn, var)
+
+
+# ----------------------------
+# 2) Create differenced variables
+# ----------------------------
+
+df_dyn["dWy"]     = Wp_dyn @ df_dyn["dy"].to_numpy()
+df_dyn["dWy_lag"] = Wp_dyn @ df_dyn["dy_lag"].to_numpy()
+
+for var in X_vars:
+    df_dyn[f"dW{var}"] = Wp_dyn @ df_dyn[f"d{var}"].to_numpy()
+
+
+# ---------------------------------
+# 3) Spatially lagged differenced variables
+# ---------------------------------
+# Use the EXISTING W_panel directly
+Wp = W_panel  
+
+df_dyn["dWy"]     = Wp.sparse @ df_dyn["dy"].to_numpy()
+df_dyn["dWy_lag"] = Wp.sparse @ df_dyn["dy_lag"].to_numpy()
+
+for var in X_vars:
+    df_dyn[f"dW{var}"] = Wp.sparse @ df_dyn[f"d{var}"].to_numpy()
+
+
+# ---------------------------------
+# 4) Build model matrices
+# ---------------------------------
+y = df_dyn["dy"].to_numpy().reshape(-1,1)
+
+X = np.column_stack([
+    df_dyn["dy_lag"].to_numpy(),           # φ Δy_{t-1}
+    df_dyn["dWy"].to_numpy(),             # ρ ΔWy
+] + [
+    df_dyn[f"d{var}"].to_numpy() for var in X_vars
+] + [
+    df_dyn[f"dW{var}"].to_numpy() for var in X_vars
+])
+
+# ----------------------------
+# 5) Estimate dynamic SDM via GMM
+# ----------------------------
+dyn_sdm = GM_Lag(
+    y=y,
+    x=X,
+    w=Wp,
+    instruments=instr,
+    lag_q=1,
+    w_lags=0,
+    name_y="dy",
+    name_x=["dy_lag","dWy"] + 
+            [f"d{v}" for v in X_vars] + 
+            [f"dW{v}" for v in X_vars],
+    name_w="W_panel"
+)
+
+print(dyn_sdm.summary)
+
+
+
+
+
+########################## Koodiblokki: Dynaamisen SDM:n toteutus (täydellinen ja toimiva)
+def build_dynamic_sdm(df_bal, W_panel, X_vars):
+    """
+    Rakentaa dynaamisen paneelin: Δy, Δy_lag, WΔy, ΔX, WΔX.
+    Palauttaa: df_dyn (vielä sisältää 1 NA/maa), Wp_dyn (yhteensopiva), rows.
+    """
+    import numpy as np
+    import pandas as pd
+
+    # 1) Varmista (Year, Country) -järjestys ja rakenna row_id
+    df_bal = df_bal.sort_values(["Year", "Country"]).reset_index(drop=True)
+    df_bal = df_bal.drop(columns=[c for c in df_bal.columns if c == "row_id"], errors="ignore")
+    df_bal["row_id"] = np.arange(df_bal.shape[0], dtype=np.int64)
+
+    # 2) Valitse sarakkeet ja tee y_{t-1}
+    cols = ["Country", "Year", "row_id", "Deforestation_Index"] + X_vars
+    df_dyn = df_bal[cols].copy()
+    df_dyn["y_lag"] = df_dyn.groupby("Country")["Deforestation_Index"].shift(1)
+
+    # Pudota vain ne, joilta y_lag puuttuu (ensimmäinen vuosi per maa)
+    df_dyn = df_dyn.dropna(subset=["y_lag"]).reset_index(drop=True)
+
+    # 3) Laita paneeli järjestykseen (Country-major, Year-minor)
+    df_dyn = df_dyn.sort_values(["Country", "Year"]).reset_index(drop=True)
+
+    # 4) Δ‑muuttujat
+    def diff_by_country(df, col):
+        return df.groupby("Country")[col].diff()
+
+    df_dyn["dy"]     = diff_by_country(df_dyn, "Deforestation_Index")
+    df_dyn["dy_lag"] = diff_by_country(df_dyn, "y_lag")
+
+    for v in X_vars:
+        df_dyn[f"d{v}"] = diff_by_country(df_dyn, v)
+
+    # 5) Leikkaa W_panel dynaamiselle rivijoukolle
+    rows = df_dyn["row_id"].to_numpy().astype(np.int64)
+    W_all = W_panel.sparse.tocsr()
+    Wp_dyn = W_all[rows][:, rows]
+
+    # 6) Spatiaalilagit differensseille
+    df_dyn["dWy"]     = Wp_dyn @ df_dyn["dy"].to_numpy()
+    df_dyn["dWy_lag"] = Wp_dyn @ df_dyn["dy_lag"].to_numpy()
+    for v in X_vars:
+        df_dyn[f"dW{v}"] = Wp_dyn @ df_dyn[f"d{v}"].to_numpy()
+
+    return df_dyn, Wp_dyn, rows
+
+
+
+def clean_dyn_for_estimation(df_dyn, Wp_dyn, X_vars):
+    """
+    Poistaa NA-rivit kaikista Δ- ja WΔ-sarakkeista ja leikkaa W:n samalle maskille.
+    Palauttaa: df_cl, W_cl
+    """
+    import numpy as np
+
+    drop_vars = (
+        ["dy","dy_lag","dWy","dWy_lag"]
+        + [f"d{v}"  for v in X_vars]
+        + [f"dW{v}" for v in X_vars]
+    )
+    mask_noNA = ~df_dyn[drop_vars].isna().any(axis=1)
+
+    df_cl = df_dyn.loc[mask_noNA].reset_index(drop=True)
+    W_cl  = Wp_dyn[mask_noNA.to_numpy(dtype=bool)][:, mask_noNA.to_numpy(dtype=bool)]
+
+    # Pieni sanity printti: montako riviä jäi
+    n_before, n_after = df_dyn.shape[0], df_cl.shape[0]
+    n_countries = df_dyn["Country"].nunique()
+    print(f"[CLEAN] dropped {n_before - n_after} rows (expected ≈ number of countries = {n_countries})")
+    return df_cl, W_cl
+
+
+
+def run_dynamic_sdm(df_dyn_clean, Wp_dyn_clean, X_vars):
+    """
+    Δ‑SDM GMM ilman AB-maskin ongelmia:
+      y = Δy, X = [Δy_{t-1}, WΔy, ΔX, WΔX], instrumentit = ΔX
+    Palauttaa: dyn_gmm (spreg.GM_Lag), SR- ja LR‑vaikutustaulukot.
+    """
+    import numpy as np
+    import pandas as pd
+    from spreg import GM_Lag
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import splu
+
+    # 1) Matriisit
+    dy_vec     = df_dyn_clean["dy"].to_numpy().reshape(-1,1)
+    dy_lag_vec = df_dyn_clean["dy_lag"].to_numpy().reshape(-1,1)
+    dWy_vec    = df_dyn_clean["dWy"].to_numpy().reshape(-1,1)
+
+    dX  = np.column_stack([df_dyn_clean[f"d{v}"].to_numpy()  for v in X_vars])
+    dWX = np.column_stack([df_dyn_clean[f"dW{v}"].to_numpy() for v in X_vars])
+
+    Xmat  = np.column_stack([dy_lag_vec, dWy_vec, dX, dWX])
+    instr = dX.copy()  # ΔX instrumentteina (vakaa ja NA‑vapaa tässä kohtaa)
+
+    # 2) GMM-estimointi
+    dyn_gmm = GM_Lag(
+        y = dy_vec,
+        x = Xmat,
+        w = Wp_dyn_clean,
+        instruments = instr,
+        lag_q = 1,
+        w_lags = 0,
+        name_y = "dy",
+        name_x = ["dy_lag","dWy"] + [f"d{v}" for v in X_vars] + [f"dW{v}" for v in X_vars],
+    )
+
+    # 3) Parametrien purku
+    params = dyn_gmm.betas.flatten()
+    k = len(X_vars)
+    phi   = params[0]            # pysyvyys
+    rho   = params[1]            # spatiaalinen palaute
+    beta  = params[2:2+k]
+    theta = params[2+k:2+2*k]
+
+    # 4) SR‑vaikutukset: (I − ρW)^{-1}(β + θW)
+    n = Wp_dyn_clean.shape[0]
+    I = sp.eye(n, format="csr")
+    A = (I - rho * Wp_dyn_clean)
+    A_inv = splu(A)
+
+    # Hutchinsonin jälkiarvio tr(S), tr(SW)
+    R = 200
+    rng = np.random.default_rng(123)
+    z = rng.choice([-1.0, 1.0], size=(n, R))
+    trace_Ainv  = (z * A_inv.solve(z)).sum(axis=0).mean()
+    Wz          = Wp_dyn_clean @ z
+    trace_AinvW = (z * A_inv.solve(Wz)).sum(axis=0).mean()
+
+    sr_direct, sr_indirect, sr_total = [], [], []
+    ones = np.ones((n,1))
+    for j in range(k):
+        b, t = beta[j], theta[j]
+        M1  = b*ones + t*(Wp_dyn_clean @ ones)
+        SM1 = A_inv.solve(M1)
+        tot = float(SM1.mean())
+        direct   = (b*trace_Ainv + t*trace_AinvW) / n
+        indirect = tot - direct
+        sr_direct.append(direct); sr_indirect.append(indirect); sr_total.append(tot)
+
+    sr = pd.DataFrame({
+        "Variable": X_vars,
+        "SR_direct": sr_direct,
+        "SR_indirect": sr_indirect,
+        "SR_total": sr_total
+    })
+
+    # 5) LR‑vaikutukset: SR / (1 − φ)
+    factor = 1.0/(1.0 - phi)
+    lr = sr.copy()
+    lr["LR_direct"]   = lr["SR_direct"]   * factor
+    lr["LR_indirect"] = lr["SR_indirect"] * factor
+    lr["LR_total"]    = lr["SR_total"]    * factor
+
+    return dyn_gmm, sr, lr
+
+
+# 1) Rakenna dynaaminen paneeli
+df_dyn, Wp_dyn, rows = build_dynamic_sdm(df_bal, W_panel, X_vars)
+
+# 2) Puhdista NA-rivit (≈ 1 per maa) ja leikkaa W samalle joukolle
+df_dyn_clean, Wp_dyn_clean = clean_dyn_for_estimation(df_dyn, Wp_dyn, X_vars)
+
+# 3) Estimoi dyn. SDM ja laske SR/LR
+dyn_gmm, sr_effects, lr_effects = run_dynamic_sdm(df_dyn_clean, Wp_dyn_clean, X_vars)
+
+# 4) Tulosta tulokset
+print(dyn_gmm.summary)
+print("\n=== SHORT-RUN EFFECTS ===")
+print(sr_effects)
+print("\n=== LONG-RUN EFFECTS ===")
+print(lr_effects)
+
+
+
+
+#############################################################################################
+################################ Hinta-analyysi #############################################
+# IQV × hinta-/kysyntäsokit –testi: pehmentävätkö hyvät instituutiot globaalien hyödykehinnan nousujen metsäkatoimpaktin?
+
+import pandas as pd
+
+# Load files
+trade = pd.read_csv('trade_data.csv', sep=';')
+roundwood = pd.read_csv('roundwood_data1.csv', sep=';')
+
+# -------------------------------
+# 1) SOY COMPOSITE (beans + oil)
+# -------------------------------
+
+soy_items = ['Soya beans', 'Soya bean oil']
+soy = trade[trade['Item'].isin(soy_items)]
+
+# Melt year columns
+val_cols = [c for c in soy.columns if c.startswith('Y')]
+soy_m = soy.melt(
+    id_vars=['Area','Item','Element','Unit'],
+    value_vars=val_cols,
+    var_name='Year',
+    value_name='Value'
+)
+soy_m['Year'] = soy_m['Year'].str[1:].astype(int)
+
+# Separate quantity/value and sum globally
+df_q = soy_m[soy_m['Element']=='Import quantity']
+df_v = soy_m[soy_m['Element']=='Import value']
+
+Q = df_q.groupby('Year')['Value'].sum()
+V = df_v.groupby('Year')['Value'].sum()
+
+soy_price = (V/Q).rename('Soy_Composite_Price')
+
+
+# -------------------------------
+# 2) PALM OIL (crude)
+# -------------------------------
+
+palm = trade[(trade['Item']=='Palm oil')]
+
+palm_m = palm.melt(
+    id_vars=['Area','Item','Element','Unit'],
+    value_vars=val_cols,
+    var_name='Year',
+    value_name='Value'
+)
+palm_m['Year'] = palm_m['Year'].str[1:].astype(int)
+
+palm_q = palm_m[palm_m['Element']=='Import quantity']
+palm_v = palm_m[palm_m['Element']=='Import value']
+
+Palm_price = (palm_v.groupby('Year')['Value'].sum() /
+              palm_q.groupby('Year')['Value'].sum()).rename('Palm_Price')
+
+
+# -------------------------------
+# 3) BEEF primary
+# -------------------------------
+
+beef = trade[(trade['Item']=='Beef and Buffalo Meat, primary')]
+
+beef_m = beef.melt(
+    id_vars=['Area','Item','Element','Unit'],
+    value_vars=val_cols,
+    var_name='Year',
+    value_name='Value'
+)
+beef_m['Year'] = beef_m['Year'].str[1:].astype(int)
+
+beef_q = beef_m[beef_m['Element']=='Import quantity']
+beef_v = beef_m[beef_m['Element']=='Import value']
+
+Beef_price = (beef_v.groupby('Year')['Value'].sum() /
+              beef_q.groupby('Year')['Value'].sum()).rename('Beef_Price')
+
+
+# -------------------------------
+# 4) TIMBER (Roundwood import unit value)
+# -------------------------------
+
+rw = roundwood[(roundwood['Item']=='Roundwood')]
+
+rw_q = rw[rw['Element']=='Import quantity'][['Year','Value']]
+rw_v = rw[rw['Element']=='Import value'][['Year','Value']]
+
+rw_price = (rw_v.groupby('Year')['Value'].sum() /
+            rw_q.groupby('Year')['Value'].sum()).rename('Timber_Price')
+
+# -------------------------------
+# 5) COMBINE ALL INTO ONE DF
+# -------------------------------
+
+result = pd.concat([soy_price, Palm_price, Beef_price, rw_price], axis=1)
+
+result
+
+# 1. Rakenna sokit Δlog(p)
+
+import pandas as pd
+
+global_prices = pd.read_excel("global_prices.xlsx")
+
+print(global_prices.head())
+
+for col in ["Soy_Composite_Price","Palm_Price","Beef_Price","Timber_Price"]:
+    global_prices[f"dlog_{col}"] = global_prices[col].apply(np.log).diff()
+
+
+# 2. Yhdistä sokit paneeliin
+
+df_bal = df_bal.merge(global_prices, on="Year", how="left")
+
+
+# Kolme WGI-komponenttia
+iqv_vars = ["Corruption_Control",
+            "Political_Stability",
+            "Rule_of_Law"]
+
+# Standardointi
+for c in iqv_vars:
+    df_bal[c+"_z"] = (df_bal[c] - df_bal[c].mean(skipna=True)) / df_bal[c].std(skipna=True)
+
+# IQV = näiden kolmen z-score keskiarvo
+df_bal["IQV"] = df_bal[[c+"_z" for c in iqv_vars]].mean(axis=1, skipna=True)
+
+# Skaalaa lopuksi IQV N(0,1) tulkittavuuden vuoksi
+df_bal["IQV_std"] = (df_bal["IQV"] - df_bal["IQV"].mean(skipna=True)) / df_bal["IQV"].std(skipna=True)
+
+print(df_bal[["Country","Year","IQV","IQV_std"]].head())
+
+
+# 3. Luo IQV-interaktiot
+
+shock_vars = [
+    "dlog_Soy_Composite_Price",
+    "dlog_Palm_Price",
+    "dlog_Beef_Price",
+    "dlog_Timber_Price"
+]
+
+interacts = [f"{s}_x_IQV" for s in shock_vars]
+
+
+# Luo vain oikeat interaktiot (eikä tuplia)
+for s in shock_vars:
+    df_bal[f"{s}_x_IQV"] = df_bal[s] * df_bal["IQV_std"]
+
+
+X_vars = (
+    shock_vars +
+    interacts +
+    ["GDP_s1","GDP_s2","GDP_s3",
+     "PD_s1","PD_s2","PD_s3",
+     "Agricultural_Land_Area",
+     "Average_Yield",
+     "Average_Stock"]
+)
+
+
+# Oikein (vaihtoehto 1)
+X = df_bal[X_vars].values
+
+# Oikein (vaihtoehto 2, suositus – varmistaa tyypin)
+X = df_bal[X_vars].to_numpy(dtype=float)
+
+
+shock_vars = [
+    "dlog_Soy_Composite_Price",
+    "dlog_Palm_Price",
+    "dlog_Beef_Price",
+    "dlog_Timber_Price"
+]
+interacts = [f"{s}_x_IQV" for s in shock_vars]
+
+
+
+import numpy as np
+
+need = X_vars + ["Deforestation_Index"]
+mask = np.isfinite(df_bal[need]).all(axis=1)
+dfm = df_bal.loc[mask].reset_index()             # säilytä vanha indeksipaikka
+idx = dfm["index"].to_numpy()
+
+# Varmista W:n dimensio
+nW = W_panel.sparse.shape[0]
+assert nW >= df_bal.shape[0], "W_panel on pienempi kuin paneelisi"
+
+# Nosta W:stä havainnoille vastaava alimatriisi
+Wm = W_panel.sparse[idx, :][:, idx]
+
+# Rakenna y, X ja WX
+y  = dfm["Deforestation_Index"].to_numpy(dtype=float).reshape(-1,1)
+X  = dfm[X_vars].to_numpy(dtype=float)
+WX = Wm.dot(dfm[shock_vars + interacts].to_numpy(dtype=float))  # vain valikoidut WX:t
+
+# SDM-tyyppinen regressorimatriisi (kompakti: X + WX)
+X_sdm = np.hstack([X, WX])
+
+
+# 4. Spline + EKC‑muunnokset GDP per Capita ja Pop Density
+# EKC (quadratic)
+
+df_bal["Gdp_pc2"] = df_bal["Gdp_per_Capita"]**2
+df_bal["PopDens2"] = df_bal["Population_Density"]**2
+
+
+def spline_2k(x, k1, k2):
+    return (
+        np.maximum(0, x - k1) - np.maximum(0, x - k2)
+    )
+
+# GDP splines
+g1, g2 = 4000, 12000
+df_bal["GDP_s1"] = np.minimum(df_bal["Gdp_per_Capita"], g1)
+df_bal["GDP_s2"] = spline_2k(df_bal["Gdp_per_Capita"], g1, g2)
+df_bal["GDP_s3"] = np.maximum(0, df_bal["Gdp_per_Capita"] - g2)
+
+# Pop density splines
+p1, p2 = df_bal["Population_Density"].quantile([0.33, 0.66])
+p1, p2 = float(p1), float(p2)
+
+df_bal["PD_s1"] = np.minimum(df_bal["Population_Density"], p1)
+df_bal["PD_s2"] = spline_2k(df_bal["Population_Density"], p1, p2)
+df_bal["PD_s3"] = np.maximum(0, df_bal["Population_Density"] - p2)
+
+# 5. Valitse X‑matriisin muuttujat
+
+X_vars = (
+    shock_vars +
+    [f"{s}_x_IQV" for s in shock_vars] +
+    ["GDP_s1","GDP_s2","GDP_s3","PD_s1","PD_s2","PD_s3",
+     "Agricultural_Land_Area","Average_Yield","Average_Stock"]
+)
+
+# 6. Spatial SDM / GS2SLS (PySAL)
+
+from spreg import GM_Lag
+import numpy as np
+
+# --- Build SDM matrices ---
+y = df_bal["Deforestation_Index"].values.reshape(-1,1)
+X = df_bal[X_vars].values
+
+# Use ONLY the sparse matrix inside W:
+WX = W_panel.sparse.dot(X)
+Wy = W_panel.sparse.dot(y)
+
+# Build SDM regressor matrix (X + WX)
+X_sdm = np.hstack([X, WX])
+
+
+# W_panel on libpysal.weights.W
+W_panel.transform = 'r'   # row-standardize
+
+
+import numpy as np
+from libpysal.weights import w_subset
+
+need = X_vars + ["Deforestation_Index"]
+mask = np.isfinite(df_bal[need]).all(axis=1)
+dfm  = df_bal.loc[mask].copy()
+ids  = dfm.index.tolist()
+
+W_sub = w_subset(W_panel, ids)     # palauttaa uuden W-olion samoille riveille
+W_sub.transform = 'r'
+
+
+# 3A) määritä vain ne muuttujat, joille haluat WX-lagin (turvallinen, pieni setti)
+shock_vars = [
+    "dlog_Soy_Composite_Price",
+    "dlog_Palm_Price",
+    "dlog_Beef_Price",
+    "dlog_Timber_Price"
+]
+interacts = [f"{s}_x_IQV" for s in shock_vars]
+
+X_core  = shock_vars + interacts + [
+    "GDP_s1","GDP_s2","GDP_s3",
+    "PD_s1","PD_s2","PD_s3",
+    "Agricultural_Land_Area","Average_Yield","Average_Stock"
+]
+
+# 3B) rakenna X ja y
+y = dfm["Deforestation_Index"].to_numpy(dtype=float).reshape(-1,1)
+X = dfm[X_core].to_numpy(dtype=float)
+
+# 3C) slx_vars = mitkä X-sarakkeet lagitetaan (True = lagitetaan)
+slx_vars_mask = [v in (shock_vars + interacts) for v in X_core]
+
+
+
+import pandas as pd
+from libpysal.weights import w_subset
+from spreg import GM_Lag
+
+
+def run_spatial_pipeline(df_bal, W_panel):
+    """
+    Full SDM/SARDLX pipeline:
+    - Δlog shocks
+    - IQV composite
+    - Interactions
+    - Splines/EKC
+    - Data cleaning
+    - W subset
+    - GM_Lag (SAR + SLX for shocks)
+    - Impacts (LeSage & Pace 2009)
+    """
+
+    df = df_bal.copy()
+
+    # ---------------------------------------------------------
+    # 1. Δlog price shocks
+    # ---------------------------------------------------------
+
+    shock_vars_raw = [
+        "Soy_Composite_Price",
+        "Palm_Price",
+        "Beef_Price",
+        "Timber_Price"
+    ]
+    for c in shock_vars_raw:
+        if c in df.columns:
+            df[f"dlog_{c}"] = np.log(df[c]).diff()
+
+    shock_vars = [f"dlog_{c}" for c in shock_vars_raw]
+
+    # ---------------------------------------------------------
+    # 2. IQV (three‑pillar governance index)
+    # ---------------------------------------------------------
+    IQV_cols = ["Corruption_Control", "Political_Stability", "Rule_of_Law"]
+
+    for col in IQV_cols:
+        mu = df[col].mean()
+        sd = df[col].std()
+        df[col + "_z"] = (df[col] - mu) / sd
+
+    df["IQV"] = df[[c+"_z" for c in IQV_cols]].mean(axis=1)
+    df["IQV_std"] = (df["IQV"] - df["IQV"].mean()) / df["IQV"].std()
+
+    # ---------------------------------------------------------
+    # 3. Interactions IQV×Δlog p
+    # ---------------------------------------------------------
+    interacts = [f"{s}_x_IQV" for s in shock_vars]
+    for s in shock_vars:
+        df[f"{s}_x_IQV"] = df[s] * df["IQV_std"]
+
+    # ---------------------------------------------------------
+    # 4. Splines + EKC
+    # ---------------------------------------------------------
+    # GDP knots
+    g1, g2 = 4000, 12000
+    x = df["Gdp_per_Capita"]
+    df["GDP_s1"] = np.minimum(x, g1)
+    df["GDP_s2"] = np.maximum(0, np.minimum(x - g1, g2 - g1))
+    df["GDP_s3"] = np.maximum(0, x - g2)
+
+    # Pop density knots (tertiiles)
+    p1, p2 = df["Population_Density"].quantile([0.33, 0.66])
+    z = df["Population_Density"]
+    df["PD_s1"] = np.minimum(z, p1)
+    df["PD_s2"] = np.maximum(0, np.minimum(z - p1, p2 - p1))
+    df["PD_s3"] = np.maximum(0, z - p2)
+
+    # ---------------------------------------------------------
+    # 5. Choose regressors
+    # ---------------------------------------------------------
+    X_core = (
+        shock_vars
+        + interacts
+        + ["GDP_s1","GDP_s2","GDP_s3",
+           "PD_s1","PD_s2","PD_s3",
+           "Agricultural_Land_Area",
+           "Average_Yield","Average_Stock"]
+    )
+
+    # SLX-lag only shocks + interactions
+    WX_targets = shock_vars + interacts
+    slx_mask = [v in WX_targets for v in X_core]
+
+    # ---------------------------------------------------------
+    # 6. Drop NaNs and subset W
+    # ---------------------------------------------------------
+    need = X_core + ["Deforestation_Index"]
+    mask = np.isfinite(df[need]).all(axis=1)
+    dfm = df.loc[mask].copy()
+
+    ids = dfm.index.tolist()
+    W_sub = w_subset(W_panel, ids)
+    W_sub.transform = 'r'
+
+    # ---------------------------------------------------------
+    # 7. Build arrays
+    # ---------------------------------------------------------
+    y = dfm["Deforestation_Index"].to_numpy(dtype=float).reshape(-1, 1)
+    X = dfm[X_core].to_numpy(dtype=float)
+
+    # ---------------------------------------------------------
+    # 8. GM_Lag estimation (SAR + SLX-lagged shocks)
+    # ---------------------------------------------------------
+    model = GM_Lag(
+        y=y,
+        x=X,
+        w=W_sub,
+        w_lags=1,
+        lag_q=False,
+        slx_lags=1,
+        slx_vars=slx_mask,
+        spat_diag=True,
+        spat_impacts='simple',
+        name_y="Deforestation_Index",
+        name_x=X_core,
+        name_w="W_sub"
+    )
+
+    # ---------------------------------------------------------
+    # 9. Manual Impacts (LeSage & Pace 2009)
+    # ---------------------------------------------------------
+    rho = float(model.rho[0])
+    beta = model.betas.flatten()
+
+    k = len(X_core)
+    k_slx = sum(slx_mask)
+
+    beta_X = beta[:k]
+    theta = beta[k:k+k_slx]
+
+    gamma = []
+    idx_slx = [i for i, v in enumerate(X_core) if v in WX_targets]
+
+    for v in shock_vars:
+        i = X_core.index(v)
+        g = beta_X[i]
+        if v in WX_targets:
+            j = idx_slx.index(i)
+            g += theta[j]
+        gamma.append(g)
+
+    Wm = W_sub.sparse
+    I = np.eye(Wm.shape[0])
+    S = np.linalg.inv(I - rho * Wm.toarray())
+
+
+    # --- Tässä kohtaa alkaa ADI/AII/ATI loop ---
+    ADI, AII, ATI = [], [], []
+    for g in gamma:
+        M = S * g
+        direct = np.mean(np.diag(M))
+        total  = np.mean(M)
+        indirect = total - direct
+
+        ADI.append(direct)
+        AII.append(indirect)
+        ATI.append(total)
+    # --- Loop päättyy tähän ---
+
+    impacts_df = pd.DataFrame({
+        "variable": shock_vars,
+        "ADI": ADI,
+        "AII": AII,
+        "ATI": ATI
+    })
+
+    return model, impacts_df, dfm, W_sub
+
+
+
+model, impacts, df_used, W_used = run_spatial_pipeline(df_bal, W_panel)
+
+print(model.summary)
+print(impacts)
